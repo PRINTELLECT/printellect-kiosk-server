@@ -1,0 +1,17 @@
+{
+  "name": "printellect-kiosk-daemon",
+  "version": "1.0.0",
+  "description": "",
+  "main": "firebase.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "firebase": "^12.16.0",
+    "pdf-to-printer": "^5.8.0"
+  }
+}
