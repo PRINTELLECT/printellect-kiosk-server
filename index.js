@@ -9,6 +9,10 @@ import readline from 'readline';
 
 const CONFIG_PATH = path.join(process.cwd(), 'config.json');
 
+// Global load trackers for balancing
+let pendingBwPages = 0;
+let pendingColorPages = 0;
+
 async function downloadFile(url, destination) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`unexpected response ${response.statusText}`);
@@ -162,21 +166,51 @@ async function processJob(jobId, jobData, config) {
       const fileName = fileData['file-name'] || `job_${jobId}_${fileDoc.id}.pdf`;
       const isColor = fileData['color'] === true;
       
-      const targetPrinter = isColor ? config.colorPrinter : config.bwPrinter;
+      const copies = fileData['copies'] || 1;
+      const pages = fileData['total-pages'] || 1;
+      const totalFilePages = copies * pages;
+      
+      let targetPrinter;
+
+      if (isColor) {
+        // Color jobs MUST go to color printer
+        targetPrinter = config.colorPrinter;
+        pendingColorPages += totalFilePages;
+      } else {
+        // B&W jobs load balancing
+        if (pendingBwPages > pendingColorPages) {
+          targetPrinter = config.colorPrinter;
+          pendingColorPages += totalFilePages;
+        } else {
+          // If equal or color > bw, send to B&W
+          targetPrinter = config.bwPrinter;
+          pendingBwPages += totalFilePages;
+        }
+      }
 
       if (downloadUrl) {
         console.log(`Downloading ${fileName}...`);
         const filePath = path.join(tempDir, fileName);
         await downloadFile(downloadUrl, filePath);
         
-        console.log(`Routing ${fileName} to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter}`);
+        console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter}`);
+        console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
         
-        // Print the file to the mapped printer
-        await ptp.print(filePath, { printer: targetPrinter });
-        console.log(`✅ Successfully printed ${fileName}`);
-        
-        // Cleanup temp file
-        fs.unlinkSync(filePath);
+        try {
+          // Print the file to the mapped printer
+          await ptp.print(filePath, { printer: targetPrinter });
+          console.log(`✅ Successfully printed ${fileName}`);
+        } finally {
+          // Decrement load tracker
+          if (targetPrinter === config.colorPrinter) {
+            pendingColorPages -= totalFilePages;
+          } else {
+            pendingBwPages -= totalFilePages;
+          }
+          
+          // Cleanup temp file
+          fs.unlinkSync(filePath);
+        }
       }
     }
 
