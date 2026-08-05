@@ -191,25 +191,34 @@ async function processJob(jobId, jobData, config) {
       if (downloadUrl) {
         console.log(`Downloading ${fileName}...`);
         const filePath = path.join(tempDir, fileName);
-        await downloadFile(downloadUrl, filePath);
-        
-        console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter}`);
-        console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
         
         try {
+          await downloadFile(downloadUrl, filePath);
+          
+          console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'}`);
+          console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
+          
+          // Only pass printer if explicitly configured
+          const printOptions = {};
+          if (targetPrinter) printOptions.printer = targetPrinter;
+          
           // Print the file to the mapped printer
-          await ptp.print(filePath, { printer: targetPrinter });
+          await ptp.print(filePath, printOptions);
           console.log(`✅ Successfully printed ${fileName}`);
+        } catch (err) {
+          console.error(`❌ Error processing file ${fileName}:`, err);
         } finally {
-          // Decrement load tracker
+          // ALWAYS Decrement load tracker to prevent permanent counter skew
           if (targetPrinter === config.colorPrinter) {
             pendingColorPages -= totalFilePages;
           } else {
             pendingBwPages -= totalFilePages;
           }
           
-          // Cleanup temp file
-          fs.unlinkSync(filePath);
+          // Cleanup temp file safely
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
         }
       }
     }
