@@ -130,8 +130,8 @@ async function startDaemon() {
       const jobId = change.doc.id;
       const jobData = change.doc.data();
 
-      // Only process when the job has been paid for and status moved to 'printing'
-      if (jobData.status === 'printing' && jobData.shopid) {
+      // Only process when the job has been paid for and status moved to 'on-queue'
+      if (jobData.status === 'on-queue' && jobData.shopid) {
         // We might want to ensure we only print it once, so we could track jobs in a Map
         // But for simplicity, we assume we just pick it up once it switches to 'printing'
         if (change.type === 'added' || change.type === 'modified') {
