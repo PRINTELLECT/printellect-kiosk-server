@@ -203,10 +203,29 @@ async function processJob(jobId, jobData, config) {
           if (targetPrinter) printOptions.printer = targetPrinter;
           
           // Print the file to the mapped printer
-          await ptp.print(filePath, printOptions);
-          console.log(`✅ Successfully printed ${fileName}`);
+          try {
+            await ptp.print(filePath, printOptions);
+            console.log(`✅ Successfully printed ${fileName}`);
+          } catch (printErr) {
+            console.error(`⚠️ Error printing to ${targetPrinter || 'Default'}: ${printErr.message}. Attempting fallback...`);
+            
+            // Try the other printer as fallback
+            const fallbackPrinter = (targetPrinter === config.colorPrinter) ? config.bwPrinter : config.colorPrinter;
+            
+            if (fallbackPrinter && fallbackPrinter !== targetPrinter) {
+              try {
+                console.log(`Routing ${fileName} to fallback printer: ${fallbackPrinter}`);
+                await ptp.print(filePath, { printer: fallbackPrinter });
+                console.log(`✅ Successfully printed ${fileName} on fallback printer`);
+              } catch (fallbackErr) {
+                console.error(`❌ Fallback also failed for ${fileName}:`, fallbackErr);
+              }
+            } else {
+              console.error(`❌ No fallback printer available for ${fileName}.`);
+            }
+          }
         } catch (err) {
-          console.error(`❌ Error processing file ${fileName}:`, err);
+          console.error(`❌ Error downloading/processing file ${fileName}:`, err);
         } finally {
           // ALWAYS Decrement load tracker to prevent permanent counter skew
           if (targetPrinter === config.colorPrinter) {
