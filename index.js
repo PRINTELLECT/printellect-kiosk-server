@@ -12,6 +12,7 @@ const CONFIG_PATH = path.join(process.cwd(), 'config.json');
 // Global load trackers for balancing
 let pendingBwPages = 0;
 let pendingColorPages = 0;
+const processingJobs = new Set();
 
 async function downloadFile(url, destination) {
   const response = await fetch(url);
@@ -132,12 +133,12 @@ async function startDaemon() {
 
       // Only process when the job has been paid for and status moved to 'on-queue'
       if (jobData.status === 'on-queue' && jobData.shopid) {
-        // We might want to ensure we only print it once, so we could track jobs in a Map
-        // But for simplicity, we assume we just pick it up once it switches to 'printing'
-        if (change.type === 'added' || change.type === 'modified') {
-          console.log(`\n[PAYMENT CLEARED] Processing Job ID: ${jobId}`);
-          await processJob(jobId, jobData, config);
+        if (processingJobs.has(jobId)) {
+          return;
         }
+        processingJobs.add(jobId);
+        console.log(`\n[PAYMENT CLEARED] Processing Job ID: ${jobId}`);
+        await processJob(jobId, jobData, config);
       }
     });
   }, (error) => {
@@ -242,14 +243,15 @@ async function processJob(jobId, jobData, config) {
       }
     }
 
-    // Update Firestore status to 'completed' and 'delivered' since it's a live kiosk job
+    // Update Firestore status to 'completed'.
+    // Kiosk door controller unlocks the tray on 'completed', and marks 'delivered' on door close ack.
     await updateDoc(taskDocRef, {
       status: 'completed',
-      'completed-time': new Date(),
-      'delivered-time': new Date()
+      'completed-time': new Date()
     });
     console.log(`Updated job ${jobId} status to completed.`);
   } catch (error) {
+    processingJobs.delete(jobId);
     console.error(`[ERROR] Failed to process job ${jobId}:`, error);
   }
 }
