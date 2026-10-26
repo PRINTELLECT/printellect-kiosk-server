@@ -1,7 +1,7 @@
 import { db, auth } from './firebase.js';
 import { signInAnonymously } from 'firebase/auth';
 import { collection, query, where, onSnapshot, getDocs, doc, updateDoc } from 'firebase/firestore';
-import ptp from 'pdf-to-printer';
+import * as printer from './printer.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -36,7 +36,7 @@ function promptUser(query) {
 
 async function setupPrinters() {
   console.log('Fetching available printers...');
-  const printers = await ptp.getPrinters();
+  const printers = await printer.getPrinters();
   
   if (printers.length === 0) {
     console.error('No printers found on this system!');
@@ -199,13 +199,17 @@ async function processJob(jobId, jobData, config) {
           console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'}`);
           console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
           
-          // Only pass printer if explicitly configured
-          const printOptions = {};
+          // Pass printer and layout options
+          const printOptions = {
+            copies: copies,
+            color: isColor,
+            duplex: fileData['fb'] === true,
+          };
           if (targetPrinter) printOptions.printer = targetPrinter;
           
           // Print the file to the mapped printer
           try {
-            await ptp.print(filePath, printOptions);
+            await printer.print(filePath, printOptions);
             console.log(`✅ Successfully printed ${fileName}`);
           } catch (printErr) {
             console.error(`⚠️ Error printing to ${targetPrinter || 'Default'}: ${printErr.message}. Attempting fallback...`);
@@ -216,7 +220,7 @@ async function processJob(jobId, jobData, config) {
             if (fallbackPrinter && fallbackPrinter !== targetPrinter) {
               try {
                 console.log(`Routing ${fileName} to fallback printer: ${fallbackPrinter}`);
-                await ptp.print(filePath, { printer: fallbackPrinter });
+                await printer.print(filePath, { ...printOptions, printer: fallbackPrinter });
                 console.log(`✅ Successfully printed ${fileName} on fallback printer`);
               } catch (fallbackErr) {
                 console.error(`❌ Fallback also failed for ${fileName}:`, fallbackErr);
