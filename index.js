@@ -161,11 +161,18 @@ async function processJob(jobId, jobData, config) {
 
     const tempDir = os.tmpdir();
 
+    let printedOnBw = false;
+    let printedOnColor = false;
+    let hasColorFile = false;
+    let hasBwFile = false;
+
     for (const fileDoc of filesSnap.docs) {
       const fileData = fileDoc.data();
       const downloadUrl = fileData['file-url'] || fileData.downloadUrl;
       const fileName = fileData['file-name'] || `job_${jobId}_${fileDoc.id}.pdf`;
       const isColor = fileData['color'] === true;
+      if (isColor) hasColorFile = true;
+      else hasBwFile = true;
       
       const copies = fileData['copies'] || 1;
       const pages = fileData['total-pages'] || 1;
@@ -174,18 +181,30 @@ async function processJob(jobId, jobData, config) {
       let targetPrinter;
 
       if (isColor) {
-        // Color jobs MUST go to color printer
+        // Color jobs MUST go to color printer (Tray 2)
+        if (!config.colorPrinter) {
+          console.error(`[ERROR] Color printer not configured! Cannot print color file ${fileName}.`);
+          continue;
+        }
         targetPrinter = config.colorPrinter;
         pendingColorPages += totalFilePages;
       } else {
-        // B&W jobs load balancing
-        if (pendingBwPages > pendingColorPages) {
-          targetPrinter = config.colorPrinter;
-          pendingColorPages += totalFilePages;
-        } else {
-          // If equal or color > bw, send to B&W
+        // B&W jobs prefer B&W printer (Tray 1), but can load-balance to color printer (Tray 2)
+        if (config.bwPrinter && config.colorPrinter) {
+          if (pendingBwPages > pendingColorPages) {
+            // Load balance to color printer (it handles both B&W and Color)
+            targetPrinter = config.colorPrinter;
+            pendingColorPages += totalFilePages;
+          } else {
+            targetPrinter = config.bwPrinter;
+            pendingBwPages += totalFilePages;
+          }
+        } else if (config.bwPrinter) {
           targetPrinter = config.bwPrinter;
           pendingBwPages += totalFilePages;
+        } else if (config.colorPrinter) {
+          targetPrinter = config.colorPrinter;
+          pendingColorPages += totalFilePages;
         }
       }
 
@@ -196,7 +215,8 @@ async function processJob(jobId, jobData, config) {
         try {
           await downloadFile(downloadUrl, filePath);
           
-          console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'}`);
+          const trayLabel = (targetPrinter === config.colorPrinter) ? 'Tray 2 (Color Printer)' : 'Tray 1 (B&W Printer)';
+          console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'} [${trayLabel}]`);
           console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
           
           // Pass printer and layout options
@@ -210,23 +230,31 @@ async function processJob(jobId, jobData, config) {
           // Print the file to the mapped printer
           try {
             await printer.print(filePath, printOptions);
-            console.log(`✅ Successfully printed ${fileName}`);
-          } catch (printErr) {
-            console.error(`⚠️ Error printing to ${targetPrinter || 'Default'}: ${printErr.message}. Attempting fallback...`);
-            
-            // Try the other printer as fallback
-            const fallbackPrinter = (targetPrinter === config.colorPrinter) ? config.bwPrinter : config.colorPrinter;
-            
-            if (fallbackPrinter && fallbackPrinter !== targetPrinter) {
-              try {
-                console.log(`Routing ${fileName} to fallback printer: ${fallbackPrinter}`);
-                await printer.print(filePath, { ...printOptions, printer: fallbackPrinter });
-                console.log(`✅ Successfully printed ${fileName} on fallback printer`);
-              } catch (fallbackErr) {
-                console.error(`❌ Fallback also failed for ${fileName}:`, fallbackErr);
-              }
+            console.log(`✅ Successfully printed ${fileName} on ${targetPrinter || 'Default'}`);
+            if (targetPrinter === config.colorPrinter) {
+              printedOnColor = true;
             } else {
-              console.error(`❌ No fallback printer available for ${fileName}.`);
+              printedOnBw = true;
+            }
+          } catch (printErr) {
+            console.error(`⚠️ Error printing to ${targetPrinter || 'Default'}: ${printErr.message}.`);
+            
+            // Fallback logic:
+            // Color jobs CANNOT fall back to B&W printer (would lose color).
+            // B&W jobs CAN fall back to Color printer.
+            if (!isColor && targetPrinter === config.bwPrinter && config.colorPrinter) {
+              try {
+                console.log(`[FALLBACK] Routing B&W file ${fileName} to Color Printer (Tray 2): ${config.colorPrinter}`);
+                await printer.print(filePath, { ...printOptions, printer: config.colorPrinter, color: false });
+                console.log(`✅ Successfully printed ${fileName} on fallback printer (${config.colorPrinter})`);
+                printedOnColor = true;
+              } catch (fallbackErr) {
+                console.error(`❌ Fallback to Color Printer also failed for ${fileName}:`, fallbackErr);
+              }
+            } else if (isColor) {
+              console.error(`❌ Fallback skipped: Color job ${fileName} cannot be sent to B&W printer.`);
+            } else {
+              console.error(`❌ No suitable fallback printer available for ${fileName}.`);
             }
           }
         } catch (err) {
@@ -241,19 +269,35 @@ async function processJob(jobId, jobData, config) {
           
           // Cleanup temp file safely
           if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
+            try {
+              fs.unlinkSync(filePath);
+            } catch (_) {}
           }
         }
       }
     }
 
-    // Update Firestore status to 'completed'.
-    // Kiosk door controller unlocks the tray on 'completed', and marks 'delivered' on door close ack.
+    // Determine collection trays for output
+    const collectionTrays = [];
+    if (printedOnBw) collectionTrays.push('Tray 1 (B&W)');
+    if (printedOnColor) collectionTrays.push('Tray 2 (Color)');
+    
+    // In case tracking was indeterminate (e.g. single printer or test), fallback based on file composition
+    if (collectionTrays.length === 0) {
+      if (hasBwFile) collectionTrays.push('Tray 1 (B&W)');
+      if (hasColorFile) collectionTrays.push('Tray 2 (Color)');
+      if (collectionTrays.length === 0) collectionTrays.push('Tray 1 (B&W)');
+    }
+
+    console.log(`\n🎉 [KIOSK OUTPUT] Job ${jobId} finished! Collection Tray(s): ${collectionTrays.join(' and ')}`);
+
+    // Update Firestore status to 'completed' with collection tray information
     await updateDoc(taskDocRef, {
       status: 'completed',
-      'completed-time': new Date()
+      'completed-time': new Date(),
+      'collection-trays': collectionTrays,
     });
-    console.log(`Updated job ${jobId} status to completed.`);
+    console.log(`Updated job ${jobId} status to completed with collection-trays.`);
   } catch (error) {
     processingJobs.delete(jobId);
     console.error(`[ERROR] Failed to process job ${jobId}:`, error);
