@@ -215,7 +215,7 @@ async function processJob(jobId, jobData, config) {
         try {
           await downloadFile(downloadUrl, filePath);
           
-          const trayLabel = (targetPrinter === config.colorPrinter) ? 'Tray 2 (Color Printer)' : 'Tray 1 (B&W Printer)';
+          const trayLabel = (targetPrinter === config.colorPrinter) ? 'Tray 2' : 'Tray 1';
           console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'} [${trayLabel}]`);
           console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
           
@@ -279,14 +279,14 @@ async function processJob(jobId, jobData, config) {
 
     // Determine collection trays for output
     const collectionTrays = [];
-    if (printedOnBw) collectionTrays.push('Tray 1 (B&W)');
-    if (printedOnColor) collectionTrays.push('Tray 2 (Color)');
+    if (printedOnBw) collectionTrays.push('Tray 1');
+    if (printedOnColor) collectionTrays.push('Tray 2');
     
     // In case tracking was indeterminate (e.g. single printer or test), fallback based on file composition
     if (collectionTrays.length === 0) {
-      if (hasBwFile) collectionTrays.push('Tray 1 (B&W)');
-      if (hasColorFile) collectionTrays.push('Tray 2 (Color)');
-      if (collectionTrays.length === 0) collectionTrays.push('Tray 1 (B&W)');
+      if (hasBwFile) collectionTrays.push('Tray 1');
+      if (hasColorFile) collectionTrays.push('Tray 2');
+      if (collectionTrays.length === 0) collectionTrays.push('Tray 1');
     }
 
     console.log(`\n🎉 [KIOSK OUTPUT] Job ${jobId} finished! Collection Tray(s): ${collectionTrays.join(' and ')}`);
