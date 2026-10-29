@@ -808,10 +808,23 @@ fi
 log "Running preflight validation..."
 
 # 1. Node.js 24 Runtime Verification
+# Preferred default: staged versioned runtime under /opt/printellect/runtime/current/bin/node
+# so /usr/bin/node, apt repositories, and legacy services remain completely untouched.
 NODE_BIN=""
+RUNTIME_OVERRIDE_BIN=""
+
 if [[ -n "${CUSTOM_NODE_BIN}" ]]; then
   NODE_BIN="${CUSTOM_NODE_BIN}"
-elif [[ -x "/usr/bin/node" ]]; then
+  RUNTIME_OVERRIDE_BIN="${CUSTOM_NODE_BIN}"
+elif [[ -x "${BASE_DIR}/runtime/current/bin/node" ]]; then
+  NODE_BIN="${BASE_DIR}/runtime/current/bin/node"
+  RUNTIME_OVERRIDE_BIN="${BASE_DIR}/runtime/current/bin/node"
+elif [[ -z "${ROOT_DIR}" && -x "/opt/printellect/runtime/current/bin/node" ]]; then
+  NODE_BIN="/opt/printellect/runtime/current/bin/node"
+  RUNTIME_OVERRIDE_BIN="/opt/printellect/runtime/current/bin/node"
+elif [[ -n "${ROOT_DIR}" && -x "${ROOT_DIR}/usr/bin/node" ]]; then
+  NODE_BIN="${ROOT_DIR}/usr/bin/node"
+elif [[ -z "${ROOT_DIR}" && -x "/usr/bin/node" ]]; then
   NODE_BIN="/usr/bin/node"
 elif command -v node >/dev/null 2>&1; then
   NODE_BIN="$(command -v node)"
@@ -835,17 +848,9 @@ if [[ -n "${NODE_BIN}" && -x "${NODE_BIN}" ]]; then
   if [[ "${NODE_MAJOR}" =~ ^[0-9]+$ ]] && [[ "${NODE_MAJOR}" -lt 24 ]]; then
     fatal "Incompatible Node.js runtime (${NODE_VER}) at ${NODE_BIN}. Printellect Kiosk Server requires Node.js >= 24 LTS."
   fi
-
-  # If default /usr/bin/node is missing on live host and no --node-bin override was requested, link /usr/bin/node
-  if [[ -z "${CUSTOM_NODE_BIN}" && ! -x "/usr/bin/node" && -z "${ROOT_DIR}" && "${DRY_RUN}" != "true" && "${PREFLIGHT_ONLY}" != "true" ]]; then
-    if [[ "$(id -u)" -eq 0 ]]; then
-      ln -sf "${NODE_BIN}" /usr/bin/node
-      log "Created symlink /usr/bin/node -> ${NODE_BIN}"
-    fi
-  fi
 else
   if [[ -z "${ROOT_DIR}" ]]; then
-    fatal "Node.js executable not found in PATH or at /usr/bin/node. Please upgrade to or stage Node.js 24 LTS first."
+    fatal "Node.js executable not found in /opt/printellect/runtime/current/bin/node, in PATH, or at /usr/bin/node. Stage Node.js 24 side-by-side using stage-node-runtime.sh first."
   else
     warn "Node.js executable not found in isolated test environment (continuing for test harness)."
   fi
@@ -1634,27 +1639,30 @@ fi
 log "Installing unit file to ${TARGET_UNIT_FILE}..."
 if [[ "${DRY_RUN}" == "true" ]]; then
   log "[DRY RUN] Would atomically install ${TEMPLATE_UNIT} -> ${TARGET_UNIT_FILE}"
-  if [[ -n "${CUSTOM_NODE_BIN}" && "$(strip_root_prefix "${CUSTOM_NODE_BIN}")" != "/usr/bin/node" ]]; then
-    log "[DRY RUN] Would write runtime override drop-in ${TARGET_RUNTIME_DROPIN_FILE} for ${CUSTOM_NODE_BIN}"
+  if [[ -n "${RUNTIME_OVERRIDE_BIN}" && "$(strip_root_prefix "${RUNTIME_OVERRIDE_BIN}")" != "/usr/bin/node" ]]; then
+    log "[DRY RUN] Would write runtime override drop-in ${TARGET_RUNTIME_DROPIN_FILE} for ${RUNTIME_OVERRIDE_BIN}"
   fi
 else
   atomic_install_file "${TEMPLATE_UNIT}" "${TARGET_UNIT_FILE}" 0644
   chown root:root "${TARGET_UNIT_FILE}" >/dev/null 2>&1 || true
 
-  # Configure custom/staged Node.js runtime override drop-in if requested
-  if [[ -n "${CUSTOM_NODE_BIN}" && "$(strip_root_prefix "${CUSTOM_NODE_BIN}")" != "/usr/bin/node" ]]; then
-    logical_exec_node="$(strip_root_prefix "${CUSTOM_NODE_BIN}")"
-    mkdir -p "${TARGET_RUNTIME_DROPIN_DIR}"
-    DROPIN_TMP="${TARGET_RUNTIME_DROPIN_FILE}.tmp.$$"
-    cat > "${DROPIN_TMP}" <<EOF
-# Managed by install-service.sh (--node-bin)
+  # Configure custom/staged Node.js runtime override drop-in if requested or auto-detected
+  EFFECTIVE_DROPIN_NODE="${RUNTIME_OVERRIDE_BIN}"
+  if [[ -n "${EFFECTIVE_DROPIN_NODE}" ]]; then
+    logical_exec_node="$(strip_root_prefix "${EFFECTIVE_DROPIN_NODE}")"
+    if [[ "${logical_exec_node}" != "/usr/bin/node" ]]; then
+      mkdir -p "${TARGET_RUNTIME_DROPIN_DIR}"
+      DROPIN_TMP="${TARGET_RUNTIME_DROPIN_FILE}.tmp.$$"
+      cat > "${DROPIN_TMP}" <<EOF
+# Managed by install-service.sh (versioned runtime override)
 [Service]
 ExecStart=
 ExecStart=${logical_exec_node} /opt/printellect/current/index.js
 EOF
-    chmod 0644 "${DROPIN_TMP}"
-    mv -f "${DROPIN_TMP}" "${TARGET_RUNTIME_DROPIN_FILE}"
-    log "Configured versioned Node.js runtime drop-in: ${TARGET_RUNTIME_DROPIN_FILE} -> ${logical_exec_node}"
+      chmod 0644 "${DROPIN_TMP}"
+      mv -f "${DROPIN_TMP}" "${TARGET_RUNTIME_DROPIN_FILE}"
+      log "Configured versioned Node.js runtime drop-in: ${TARGET_RUNTIME_DROPIN_FILE} -> ${logical_exec_node}"
+    fi
   elif [[ -f "${TARGET_RUNTIME_DROPIN_FILE}" ]]; then
     rm -f "${TARGET_RUNTIME_DROPIN_FILE}"
     rmdir "${TARGET_RUNTIME_DROPIN_DIR}" 2>/dev/null || true
@@ -1749,6 +1757,14 @@ if [[ "${DRY_RUN}" != "true" ]] && systemd_active; then
             expected_cwd="$(readlink -f "/opt/printellect/current" 2>/dev/null || echo "/opt/printellect/current")"
             if [[ -n "${proc_cwd}" && "${proc_cwd}" != "${expected_cwd}" ]]; then
               FAILURE_REASON="MainPID ${main_pid} working directory '${proc_cwd}' does not match release '${expected_cwd}'"
+              break
+            fi
+          fi
+          if [[ -L "/proc/${main_pid}/exe" ]]; then
+            proc_exe="$(readlink -f "/proc/${main_pid}/exe" 2>/dev/null || true)"
+            expected_exe="$(readlink -f "${RUNTIME_OVERRIDE_BIN:-/usr/bin/node}" 2>/dev/null || true)"
+            if [[ -n "${proc_exe}" && -n "${expected_exe}" && "${proc_exe}" != "${expected_exe}" ]]; then
+              FAILURE_REASON="MainPID ${main_pid} executable '${proc_exe}' does not match expected Node runtime '${expected_exe}'"
               break
             fi
           fi
@@ -1869,6 +1885,7 @@ echo "=========================================================="
 echo "   PRINTELLECT SYSTEMD SERVICE CONFIGURATION COMPLETE     "
 echo "=========================================================="
 echo "Service Unit       : ${TARGET_UNIT_FILE}"
+echo "Node.js Runtime    : $(strip_root_prefix "${RUNTIME_OVERRIDE_BIN:-/usr/bin/node}")"
 echo "Service Account    : ${SERVICE_USER} (Group: ${SERVICE_GROUP}, ${CUPS_GROUP})"
 echo "Working Directory  : ${CURRENT_LINK}"
 echo "Environment File   : ${ENV_FILE} (Mode: 0640)"

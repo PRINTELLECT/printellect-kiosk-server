@@ -14,7 +14,8 @@
  *      source file byte-for-byte so stale dist/ artifacts are deterministically rejected.
  *
  * Usage:
- *   node scripts/verify-release.js <manifest.json> <signature.sig> <publicKey.pem> [archive.tar.gz] [--check-workspace]
+ *   node scripts/verify-release.js <manifest.json> <signature.sig> [publicKey.pem] [archive.tar.gz] [--check-workspace]
+ *   (When [publicKey.pem] is omitted, defaults to the pinned production key at keys/release-key.pub.pem.)
  */
 import fs from 'fs';
 import os from 'os';
@@ -26,10 +27,19 @@ import { REQUIRED_FILES, FORBIDDEN_PATTERNS } from './package-release.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORKSPACE_ROOT = path.resolve(__dirname, '..');
+export const PINNED_PUBLIC_KEY_PATH = path.join(DEFAULT_WORKSPACE_ROOT, 'keys', 'release-key.pub.pem');
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$/;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 const ALLOWED_ARCHIVE_DIRS = new Set(['.', 'bin', 'scripts', 'systemd']);
+
+export function normalizePemKeyBody(pemText) {
+  return String(pemText || '')
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith('-----'))
+    .join('')
+    .replace(/\s+/g, '');
+}
 
 function assertExtractedTreeHasNoLinks(dirPath) {
   const entries = fs.readdirSync(dirPath);
@@ -54,7 +64,7 @@ export function verifyRelease(opts = {}) {
   const {
     manifestPath,
     sigPath,
-    pubKeyPath,
+    pubKeyPath = PINNED_PUBLIC_KEY_PATH,
     archivePath: archiveOverride = null,
     checkWorkspace = false,
     workspaceRoot = DEFAULT_WORKSPACE_ROOT,
@@ -73,6 +83,11 @@ export function verifyRelease(opts = {}) {
   const manifestData = fs.readFileSync(manifestPath);
   const signature = fs.readFileSync(sigPath);
   const publicKey = fs.readFileSync(pubKeyPath, 'utf8');
+  const pinnedKeyExists = fs.existsSync(PINNED_PUBLIC_KEY_PATH);
+  const usedPinnedProductionKey =
+    pinnedKeyExists &&
+    normalizePemKeyBody(publicKey) ===
+      normalizePemKeyBody(fs.readFileSync(PINNED_PUBLIC_KEY_PATH, 'utf8'));
 
   // 1. Cryptographic signature verification (Ed25519 signatures must be exactly 64 bytes)
   if (signature.length !== 64 || !verifySignature(manifestData, signature, publicKey)) {
@@ -336,6 +351,7 @@ export function verifyRelease(opts = {}) {
     archivePath: resolvedArchive,
     archiveSha256: actualArchiveHash,
     workspaceFresh: checkWorkspace,
+    usedPinnedProductionKey,
   };
 }
 
@@ -359,11 +375,22 @@ if (isDirectRun) {
     }
   }
 
-  const [manifestPath, sigPath, pubKeyPath, archiveOverride] = positional;
+  const [manifestPath, sigPath, thirdArg, fourthArg] = positional;
+  let pubKeyPath = PINNED_PUBLIC_KEY_PATH;
+  let archiveOverride = null;
 
-  if (!manifestPath || !sigPath || !pubKeyPath || positional.length > 4) {
+  if (thirdArg) {
+    if (thirdArg.endsWith('.tar.gz') && !fourthArg) {
+      archiveOverride = thirdArg;
+    } else {
+      pubKeyPath = thirdArg;
+      archiveOverride = fourthArg || null;
+    }
+  }
+
+  if (!manifestPath || !sigPath || positional.length > 4) {
     console.error(
-      'Usage: node scripts/verify-release.js <manifest.json> <signature.sig> <publicKey.pem> [archive.tar.gz] [--check-workspace]'
+      'Usage: node scripts/verify-release.js <manifest.json> <signature.sig> [publicKey.pem] [archive.tar.gz] [--check-workspace]'
     );
     process.exit(1);
   }
@@ -378,6 +405,13 @@ if (isDirectRun) {
     });
 
     console.log('✅ Manifest Ed25519 signature is VALID.');
+    if (res.usedPinnedProductionKey) {
+      console.log('✅ Trust Anchor: Pinned production public key (keys/release-key.pub.pem).');
+    } else {
+      console.warn(
+        `⚠️  [NON-PRODUCTION KEY] Verified against unpinned custom public key (${pubKeyPath}).`
+      );
+    }
     console.log(`   Release: ${res.name} v${res.version} (${res.architecture})`);
     console.log(`✅ Archive SHA-256 checksum matches: ${res.archiveSha256}`);
     console.log(`✅ All ${REQUIRED_FILES.length} required files verified inside archive.`);

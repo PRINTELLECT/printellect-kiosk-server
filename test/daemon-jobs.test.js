@@ -531,5 +531,300 @@ describe('Phase 5 — Firestore Job Lifecycle, Payment Gate, Shared Queue & Expl
     const second = selectTargetPrinter({ isColor: false, config: dualCfg, state: st });
     assert.equal(second.targetPrinter, 'Canon_Color');
   });
+
+  it('should mark empty file lists, all-disabled printer configs, dual-queue CUPS failures, and partial multi-file failures as failed without unlocking collection trays', async () => {
+    const state = createFreshState();
+
+    // 1. Empty files subcollection -> status: 'failed', zero print calls, zero collection-trays
+    const emptyUpdates = [];
+    let emptyPrints = 0;
+    const emptyRes = await processJob(
+      'job_empty_files',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        state,
+        statusRetryDelayMs: 0,
+        db: {},
+        doc: (_db, col, id) => ({ col, id }),
+        collection: (_db, p) => ({ path: p }),
+        getDocs: async () => ({ empty: true, docs: [] }),
+        fetch: makeFakeFetch({ '*': { ok: true } }),
+        printer: { print: async () => { emptyPrints += 1; } },
+        updateDoc: async (_ref, data) => emptyUpdates.push(data),
+      }
+    );
+    assert.equal(emptyRes.outcome, 'failed');
+    assert.equal(emptyRes.reason, 'empty_files');
+    assert.equal(emptyPrints, 0);
+    assert.equal(emptyUpdates.length, 1);
+    assert.equal(emptyUpdates[0].status, 'failed');
+    assert.equal('collection-trays' in emptyUpdates[0], false, 'Failed empty job must never write collection-trays');
+
+    // 2. Both printer roles unavailable (bwPrinter: null, colorPrinter: null) -> status: 'failed'
+    const noPrinterUpdates = [];
+    const noPrinterRes = await processJob(
+      'job_no_printers_configured',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: null, colorPrinter: null },
+      {
+        tempDir,
+        state,
+        statusRetryDelayMs: 0,
+        db: {},
+        doc: (_db, col, id) => ({ col, id }),
+        collection: (_db, p) => ({ path: p }),
+        getDocs: async () => ({
+          empty: false,
+          docs: [
+            {
+              id: 'f1',
+              data: () => ({
+                'file-url': 'https://storage.example.com/bw.pdf',
+                'file-name': 'bw.pdf',
+                color: false,
+                copies: 1,
+              }),
+            },
+          ],
+        }),
+        fetch: makeFakeFetch({ '*': { ok: true } }),
+        printer: { print: async () => { throw new Error('Should not print'); } },
+        updateDoc: async (_ref, data) => noPrinterUpdates.push(data),
+      }
+    );
+    assert.equal(noPrinterRes.outcome, 'failed');
+    assert.equal(noPrinterUpdates[0].status, 'failed');
+    assert.match(noPrinterUpdates[0]['failure-reason'], /No B&W or Color printer configured/);
+    assert.equal('collection-trays' in noPrinterUpdates[0], false);
+
+    // 3. Dual-queue CUPS fallback: B&W fails on HP_BW -> succeeds once on Canon_Color (Tray 2)
+    const dualConfig = { bwPrinter: 'HP_BW', colorPrinter: 'Canon_Color' };
+    const fbUpdates = [];
+    const fbPrintCalls = [];
+    const fbRes = await processJob(
+      'job_bw_fallback_ok',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      dualConfig,
+      {
+        tempDir,
+        state,
+        statusRetryDelayMs: 0,
+        db: {},
+        doc: (_db, col, id) => ({ col, id }),
+        collection: (_db, p) => ({ path: p }),
+        getDocs: async () => ({
+          empty: false,
+          docs: [
+            {
+              id: 'f_bw',
+              data: () => ({
+                'file-url': 'https://storage.example.com/notes.pdf',
+                'file-name': 'notes.pdf',
+                color: false,
+                copies: 1,
+              }),
+            },
+          ],
+        }),
+        fetch: makeFakeFetch({ '*': { ok: true } }),
+        printer: {
+          print: async (_fp, opts) => {
+            fbPrintCalls.push(opts);
+            if (opts.printer === 'HP_BW') {
+              throw new Error('lp: HP_BW paper jam');
+            }
+          },
+        },
+        updateDoc: async (_ref, data) => fbUpdates.push(data),
+      }
+    );
+    assert.equal(fbRes.outcome, 'completed');
+    assert.equal(fbPrintCalls.length, 2);
+    assert.equal(fbPrintCalls[1].printer, 'Canon_Color');
+    assert.equal(fbPrintCalls[1].color, false, 'B&W fallback on color printer must enforce grayscale');
+    assert.deepEqual(fbUpdates[0]['collection-trays'], ['Tray 2']);
+
+    // 4. Dual-queue CUPS error on BOTH primary and fallback -> status: 'failed', zero completed/door unlock
+    const bothFailUpdates = [];
+    const bothFailRes = await processJob(
+      'job_dual_both_fail',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      dualConfig,
+      {
+        tempDir,
+        state,
+        statusRetryDelayMs: 0,
+        db: {},
+        doc: (_db, col, id) => ({ col, id }),
+        collection: (_db, p) => ({ path: p }),
+        getDocs: async () => ({
+          empty: false,
+          docs: [
+            {
+              id: 'f_bw2',
+              data: () => ({
+                'file-url': 'https://storage.example.com/notes2.pdf',
+                'file-name': 'notes2.pdf',
+                color: false,
+                copies: 1,
+              }),
+            },
+          ],
+        }),
+        fetch: makeFakeFetch({ '*': { ok: true } }),
+        printer: {
+          print: async (_fp, opts) => {
+            throw new Error(`lp: ${opts.printer} offline`);
+          },
+        },
+        updateDoc: async (_ref, data) => bothFailUpdates.push(data),
+      }
+    );
+    assert.equal(bothFailRes.outcome, 'failed');
+    assert.equal(bothFailUpdates.length, 1);
+    assert.equal(bothFailUpdates[0].status, 'failed');
+    assert.equal('collection-trays' in bothFailUpdates[0], false);
+
+    // 5. Partial multi-file failure (file 1 prints, file 2 fails CUPS) -> status: 'failed', NEVER 'completed',
+    //    and duplicate/stale 'on-queue' retry CANNOT re-print file 1!
+    const partialUpdates = [];
+    const partialPrintedFiles = [];
+    const partialDeps = {
+      tempDir,
+      state,
+      statusRetryDelayMs: 0,
+      db: {},
+      doc: (_db, col, id) => ({ col, id }),
+      collection: (_db, p) => ({ path: p }),
+      getDocs: async () => ({
+        empty: false,
+        docs: [
+          {
+            id: 'f_part_1',
+            data: () => ({
+              'file-url': 'https://storage.example.com/part1.pdf',
+              'file-name': 'part1.pdf',
+              color: false,
+              copies: 1,
+            }),
+          },
+          {
+            id: 'f_part_2',
+            data: () => ({
+              'file-url': 'https://storage.example.com/part2.pdf',
+              'file-name': 'part2.pdf',
+              color: true,
+              copies: 1,
+            }),
+          },
+        ],
+      }),
+      fetch: makeFakeFetch({ '*': { ok: true } }),
+      printer: {
+        print: async (fp, opts) => {
+          if (opts.color === true) {
+            throw new Error('lp: out of cyan ink');
+          }
+          partialPrintedFiles.push(path.basename(fp));
+        },
+      },
+      updateDoc: async (_ref, data) => partialUpdates.push(data),
+    };
+
+    const partialRes = await processJob(
+      'job_partial_failure',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      partialDeps
+    );
+    assert.equal(partialRes.outcome, 'failed');
+    assert.equal(partialRes.printedFiles, 1);
+    assert.equal(partialRes.totalFiles, 2);
+    assert.equal(partialPrintedFiles.length, 1);
+    assert.equal(partialUpdates.length, 1);
+    assert.equal(partialUpdates[0].status, 'failed');
+    assert.equal(partialUpdates[0]['printed-files'], 1);
+    assert.equal(partialUpdates[0]['total-files'], 2);
+    assert.equal('collection-trays' in partialUpdates[0], false, 'Partially printed job must never unlock tray');
+
+    // Duplicate/stale invocation for same failed job ID must NOT re-print file 1
+    const duplicatePartialRes = await processJob(
+      'job_partial_failure',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      partialDeps
+    );
+    assert.equal(duplicatePartialRes.outcome, 'duplicate_ignored');
+    assert.equal(partialPrintedFiles.length, 1, 'File 1 must NOT be printed a second time');
+  });
+
+  it('should retry transient Firestore status writes without duplicate printing or duplicate delivery transitions', async () => {
+    const state = createFreshState();
+    let printCount = 0;
+    let updateAttempts = 0;
+    const committedUpdates = [];
+
+    const deps = {
+      tempDir,
+      state,
+      statusRetryDelayMs: 0,
+      db: {},
+      doc: (_db, col, id) => ({ col, id }),
+      collection: (_db, p) => ({ path: p }),
+      getDocs: async () => ({
+        empty: false,
+        docs: [
+          {
+            id: 'f1',
+            data: () => ({
+              'file-url': 'https://storage.example.com/receipt.pdf',
+              'file-name': 'receipt.pdf',
+              color: false,
+              copies: 1,
+            }),
+          },
+        ],
+      }),
+      fetch: makeFakeFetch({ '*': { ok: true } }),
+      printer: {
+        print: async () => {
+          printCount += 1;
+        },
+      },
+      updateDoc: async (_ref, data) => {
+        updateAttempts += 1;
+        if (updateAttempts === 1) {
+          throw new Error('UNAVAILABLE: transient Firestore transport error');
+        }
+        committedUpdates.push(data);
+      },
+    };
+
+    const res = await processJob(
+      'job_transient_status_write',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      deps
+    );
+    assert.equal(res.outcome, 'completed');
+    assert.equal(printCount, 1, 'Status write retry must NEVER re-print the document');
+    assert.equal(updateAttempts, 2);
+    assert.equal(committedUpdates.length, 1);
+    assert.equal(committedUpdates[0].status, 'completed');
+
+    // Even if external door hardware subsequently sets status='delivered' and a stale cached 'on-queue' snapshot arrives,
+    // completedJobs prevents re-printing or re-writing status='completed' (no duplicate door-unlock transition).
+    const staleReplay = await processJob(
+      'job_transient_status_write',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      deps
+    );
+    assert.equal(staleReplay.outcome, 'duplicate_ignored');
+    assert.equal(printCount, 1);
+    assert.equal(committedUpdates.length, 1);
+  });
 });
 

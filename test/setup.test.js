@@ -1,7 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'stream';
-import { buildPrinterConfiguration, runSetupWizard } from '../setup.js';
+import {
+  buildPrinterConfiguration,
+  runSetupWizard,
+  parseSetupCliArgs,
+  runSetupCli,
+} from '../setup.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -216,6 +221,70 @@ describe('Setup Wizard - Interactive Flow Simulation', () => {
     assert.equal(result.success, false);
     assert.equal(result.cancelled, true);
     assert.equal(fs.existsSync(targetPath), false);
+
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('should parse CLI arguments and support non-interactive setup without launching wizard prompts', async () => {
+    // 1. Argument parser validation
+    const parsed = parseSetupCliArgs([
+      '--bw', 'Canon_GX6100',
+      '--color', 'Canon_GX6100',
+      '--skip-verify-queues',
+      '--config-path', '/tmp/test-cfg.json',
+    ]);
+    assert.equal(parsed.bwQueue, 'Canon_GX6100');
+    assert.equal(parsed.colorQueue, 'Canon_GX6100');
+    assert.equal(parsed.skipVerifyQueues, true);
+    assert.equal(parsed.configPath, '/tmp/test-cfg.json');
+
+    assert.throws(() => parseSetupCliArgs(['--unknown-flag']), /Unknown option: --unknown-flag/);
+    assert.throws(() => parseSetupCliArgs(['--bw']), /Option --bw requires a queue name/);
+
+    // 2. Non-interactive CLI run with queue validation
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'printellect-cli-setup-test-'));
+    const targetPath = path.join(tempDir, 'config.json');
+    const mockPrinters = [{ name: 'Canon_GX6100', status: 'idle' }];
+
+    const output = new PassThrough();
+    const okRes = await runSetupCli(
+      ['--bw', 'Canon_GX6100', '--color', 'Canon_GX6100'],
+      {
+        printerProvider: async () => mockPrinters,
+        targetPath,
+        output,
+      }
+    );
+    assert.equal(okRes.success, true);
+    assert.equal(okRes.mode, 'non-interactive');
+    assert.deepEqual(okRes.config, { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' });
+    assert.equal(fs.existsSync(targetPath), true);
+
+    // 3. Rejects unknown printer in non-interactive mode
+    const badRes = await runSetupCli(
+      ['--bw', 'NonExistentQueue', '--color', 'Canon_GX6100'],
+      {
+        printerProvider: async () => mockPrinters,
+        targetPath,
+        output,
+      }
+    );
+    assert.equal(badRes.success, false);
+    assert.match(badRes.errors[0], /does not exist in available printers/);
+
+    // 4. Diagnostic --list mode
+    const listRes = await runSetupCli(['--list'], {
+      printerProvider: async () => mockPrinters,
+      output,
+    });
+    assert.equal(listRes.success, true);
+    assert.equal(listRes.mode, 'list');
+    assert.equal(listRes.printers.length, 1);
+
+    // 5. Help mode
+    const helpRes = await runSetupCli(['--help'], { output });
+    assert.equal(helpRes.success, true);
+    assert.equal(helpRes.mode, 'help');
 
     fs.rmSync(tempDir, { recursive: true, force: true });
   });

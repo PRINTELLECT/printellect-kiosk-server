@@ -251,6 +251,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       '--session-id', secretToken,
       '--local-release-dir', relDistDir,
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--root-dir', toPosixRel(installRoot),
       '--dry-run',
       '--allow-unsupported-arch',
@@ -303,6 +304,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       '--session-id', secretToken,
       '--local-release-dir', relDistDir,
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--root-dir', relRoot,
       '--skip-npm-ci',
       '--skip-printer-setup',
@@ -337,7 +339,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       'set -euo pipefail',
       'EXT4_ROOT="$(mktemp -d /tmp/printellect-ext4-perm.XXXXXX)"',
       'trap \'rm -rf "${EXT4_ROOT}"\' EXIT',
-      'bash "$1" --session-id "$2" --local-release-dir "$3" --pubkey "$4" --root-dir "${EXT4_ROOT}" --skip-npm-ci --skip-printer-setup --allow-unsupported-arch >/dev/null',
+      'bash "$1" --session-id "$2" --local-release-dir "$3" --pubkey "$4" --allow-untrusted-pubkey --root-dir "${EXT4_ROOT}" --skip-npm-ci --skip-printer-setup --allow-unsupported-arch >/dev/null',
       'ENV_MODE="$(stat -c \'%a\' "${EXT4_ROOT}/etc/printellect/kiosk.env")"',
       'BAK_MODE="$(stat -c \'%a\' "${EXT4_ROOT}/var/lib/printellect/backups")"',
       'INST_MODE="$(stat -c \'%a\' "${EXT4_ROOT}/opt/printellect/current/scripts/install-service.sh")"',
@@ -379,6 +381,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
     const commonArgs = [
       '--session-id', 'station_upgrade_01',
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--root-dir', relRoot,
       '--skip-npm-ci',
       '--skip-printer-setup',
@@ -461,11 +464,12 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
     const untrustedPubkey = path.join(tempDir, 'untrusted.pub.pem');
     fs.writeFileSync(untrustedPubkey, differentKey.publicKey);
 
-    // Wrong public key
+    // Wrong public key (even with --allow-untrusted-pubkey, signature mismatch is rejected)
     let res = runBootstrap([
       '--session-id', 'kiosk_station_01',
       '--local-release-dir', relDistDir,
       '--pubkey', toPosixRel(untrustedPubkey),
+      '--allow-untrusted-pubkey',
       '--dry-run',
       '--allow-unsupported-arch',
     ]);
@@ -480,6 +484,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       '--session-id', 'kiosk_station_01',
       '--local-release-dir', relDistDir,
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--dry-run',
       '--allow-unsupported-arch',
     ]);
@@ -492,6 +497,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       '--session-id', 'kiosk_station_01',
       '--local-release-dir', relDistDir,
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--dry-run',
       '--allow-unsupported-arch',
     ]);
@@ -509,6 +515,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       '--session-id', 'kiosk_station_01',
       '--local-release-dir', relDistDir,
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--dry-run',
       '--allow-unsupported-arch',
     ]);
@@ -525,6 +532,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
       '--session-id', 'kiosk_station_01',
       '--local-release-dir', relDistDir,
       '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
       '--dry-run',
       '--allow-unsupported-arch',
     ]);
@@ -543,6 +551,7 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
         '--session-id', 'kiosk_station_01',
         '--local-release-dir', relAdv,
         '--pubkey', relPubkeyPath,
+        '--allow-untrusted-pubkey',
         '--dry-run',
         '--allow-unsupported-arch',
       ]);
@@ -655,5 +664,98 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
     res = runAdv();
     assert.equal(res.status, 1);
     assert.match(res.stderr, /INVALID MANIFEST SCHEMA|Manifest schema validation failed/);
+  });
+
+  it('should enforce pinned production trust anchor by default, block unpinned --pubkey overrides without --allow-untrusted-pubkey, and never mutate production state on invalid releases', () => {
+    const prodRoot = path.join(tempDir, 'prod_state_guard');
+    const relProdRoot = toPosixRel(prodRoot);
+    const cfgDir = path.join(prodRoot, 'var', 'lib', 'printellect');
+    const bakDir = path.join(cfgDir, 'backups');
+    const envDir = path.join(prodRoot, 'etc', 'printellect');
+    fs.mkdirSync(bakDir, { recursive: true });
+    fs.mkdirSync(envDir, { recursive: true });
+
+    const sentinelCfg = '{"bwPrinter":"Canon_GX6100","colorPrinter":"Canon_GX6100"}\n';
+    const sentinelEnv = 'KIOSK_SESSION_ID="existing_live_session"\n';
+    const sentinelBak = 'EXISTING_UNIT_BACKUP\n';
+    fs.writeFileSync(path.join(cfgDir, 'config.json'), sentinelCfg);
+    fs.writeFileSync(path.join(envDir, 'kiosk.env'), sentinelEnv);
+    fs.writeFileSync(path.join(bakDir, 'legacy.service.bak'), sentinelBak);
+
+    const assertProdStateUntouched = () => {
+      assert.equal(fs.readFileSync(path.join(cfgDir, 'config.json'), 'utf8'), sentinelCfg);
+      assert.equal(fs.readFileSync(path.join(envDir, 'kiosk.env'), 'utf8'), sentinelEnv);
+      assert.equal(fs.readFileSync(path.join(bakDir, 'legacy.service.bak'), 'utf8'), sentinelBak);
+      assert.equal(fs.existsSync(path.join(prodRoot, 'opt', 'printellect', 'current')), false);
+      assert.equal(fs.existsSync(path.join(prodRoot, 'opt', 'printellect', 'releases')), false);
+    };
+
+    // 1. Co-downloaded / attacker --pubkey WITHOUT --allow-untrusted-pubkey MUST fail closed before state changes
+    const bypassAttempt = runBootstrap([
+      '--session-id', 'attacker_session_01',
+      '--local-release-dir', relDistDir,
+      '--pubkey', relPubkeyPath,
+      '--root-dir', relProdRoot,
+      '--skip-npm-ci',
+      '--skip-printer-setup',
+      '--allow-unsupported-arch',
+    ]);
+    assert.equal(bypassAttempt.status, 1);
+    assert.match(bypassAttempt.stderr, /TRUST ANCHOR VIOLATION/);
+    assertProdStateUntouched();
+
+    // 2. Default production invocation (NO --pubkey) MUST reject ephemeral/attacker-signed release before state changes
+    const wrongSignerNoFlag = runBootstrap([
+      '--session-id', 'prod_station_01',
+      '--local-release-dir', relDistDir,
+      '--root-dir', relProdRoot,
+      '--skip-npm-ci',
+      '--skip-printer-setup',
+      '--allow-unsupported-arch',
+    ]);
+    assert.equal(wrongSignerNoFlag.status, 1);
+    assert.match(wrongSignerNoFlag.stderr, /CRYPTOGRAPHIC VERIFICATION FAILED/);
+    assertProdStateUntouched();
+
+    // 3. Modified extracted file in non-dry-run mode MUST fail closed before mutating production state
+    const privPem = fs.readFileSync(testPrivkeyPath, 'utf8');
+    const { entries, sourceFiles } = buildValidBaseEntries();
+    const tamperedExtractDir = path.join(tempDir, 'tampered_extract_dist');
+    writeSignedDist(
+      tamperedExtractDir,
+      craftRawUstarTarGz(
+        entries.map((e) => (e.name === 'printer.js' ? { ...e, content: Buffer.from('// tampered\n') } : e))
+      ),
+      sourceFiles,
+      privPem
+    );
+    const tamperedExtractRun = runBootstrap([
+      '--session-id', 'prod_station_01',
+      '--local-release-dir', toPosixRel(tamperedExtractDir),
+      '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
+      '--root-dir', relProdRoot,
+      '--skip-npm-ci',
+      '--skip-printer-setup',
+      '--allow-unsupported-arch',
+    ]);
+    assert.equal(tamperedExtractRun.status, 1);
+    assert.match(tamperedExtractRun.stderr, /ARCHIVE INTEGRITY MISMATCH/);
+    assertProdStateUntouched();
+
+    // 4. Default production invocation (NO --pubkey) against repository's production-signed dist/ MUST succeed
+    const prodSignedRun = runBootstrap([
+      '--session-id', 'prod_station_01',
+      '--local-release-dir', 'dist',
+      '--root-dir', relProdRoot,
+      '--skip-npm-ci',
+      '--skip-printer-setup',
+      '--allow-unsupported-arch',
+    ]);
+    assert.equal(prodSignedRun.status, 0, `Expected pinned prod dist/ verification to pass: ${prodSignedRun.stderr}`);
+    assert.match(prodSignedRun.stdout, /Using pinned official production public key/);
+    assert.equal(fs.readFileSync(path.join(cfgDir, 'config.json'), 'utf8'), sentinelCfg);
+    assert.equal(fs.readFileSync(path.join(bakDir, 'legacy.service.bak'), 'utf8'), sentinelBak);
+    assert.equal(fs.existsSync(path.join(prodRoot, 'opt', 'printellect', 'current', 'index.js')), true);
   });
 });

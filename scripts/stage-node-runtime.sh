@@ -276,7 +276,12 @@ esac
 
 DIST_STEM="node-${NODE_VERSION}-linux-${NODE_ARCH}"
 ARCHIVE_FILENAME="${DIST_STEM}.tar.xz"
-if [[ -n "${LOCAL_TARBALL}" && "${LOCAL_TARBALL}" == *.tar.gz ]]; then
+if [[ -n "${LOCAL_TARBALL}" ]]; then
+  if [[ "${LOCAL_TARBALL}" == *.tar.gz ]]; then
+    ARCHIVE_FILENAME="${DIST_STEM}.tar.gz"
+  fi
+elif ! command -v xz >/dev/null 2>&1; then
+  # Fallback to official .tar.gz if xz (xz-utils) is not installed on minimal Debian 13
   ARCHIVE_FILENAME="${DIST_STEM}.tar.gz"
 fi
 
@@ -352,6 +357,9 @@ EXTRACT_TMP="${RUNTIME_BASE}/.stage-${DIST_STEM}-$$"
 mkdir -p "${EXTRACT_TMP}"
 
 if [[ "${ARCHIVE_FILENAME}" == *.tar.xz ]]; then
+  if ! command -v xz >/dev/null 2>&1; then
+    fatal "xz (xz-utils) is required to extract ${ARCHIVE_FILENAME}. Install xz-utils (apt install -y xz-utils) or provide the official node-*.tar.gz archive."
+  fi
   tar -xJf "${STAGED_ARCHIVE}" -C "${EXTRACT_TMP}" --strip-components=1 --no-same-owner
 else
   tar -xzf "${STAGED_ARCHIVE}" -C "${EXTRACT_TMP}" --strip-components=1 --no-same-owner

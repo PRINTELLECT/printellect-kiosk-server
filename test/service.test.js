@@ -1599,4 +1599,76 @@ WantedBy=multi-user.target
     assert.equal(stalePidRes.status, 1, 'Unchanged MainPID across restart must be rejected as stale');
     assert.match(stalePidRes.stderr, /stale MainPID \(4242\) unchanged from previous service instance/);
   });
+
+  it('should auto-detect staged Node 24 runtime without --node-bin, leave /usr/bin/node v20 untouched, and rollback cleanly to legacy on v20', () => {
+    const { caseRoot, relRoot, mock } = seedPowerLossFixture('staged_node24_default');
+
+    // 1. Plant legacy service running on /usr/bin/node (v20.19.2)
+    const usrBinDir = path.join(caseRoot, 'usr', 'bin');
+    fs.mkdirSync(usrBinDir, { recursive: true });
+    const eolNodeBin = path.join(usrBinDir, 'node');
+    fs.writeFileSync(eolNodeBin, '#!/usr/bin/env bash\necho "v20.19.2"\n', { mode: 0o755 });
+
+    // 2. Plant staged Node.js 24 runtime in /opt/printellect/runtime/current/bin/node
+    const stagedBinDir = path.join(caseRoot, 'opt', 'printellect', 'runtime', 'current', 'bin');
+    fs.mkdirSync(stagedBinDir, { recursive: true });
+    const stagedNodeBin = path.join(stagedBinDir, 'node');
+    fs.writeFileSync(stagedNodeBin, '#!/usr/bin/env bash\necho "v24.14.0"\n', { mode: 0o755 });
+
+    // 3. Plant release directory at /opt/printellect/current
+    const currentRelDir = path.join(caseRoot, 'opt', 'printellect', 'current');
+    fs.mkdirSync(currentRelDir, { recursive: true });
+    fs.writeFileSync(path.join(currentRelDir, 'index.js'), 'console.log("running daemon");\n');
+
+    // 4. Run installer with --migrate-legacy auto --enable --start (WITHOUT --node-bin!)
+    const cutoverRes = runInstaller(
+      [
+        '--root-dir', relRoot,
+        '--migrate-legacy', 'auto',
+        '--enable',
+        '--start',
+        '--health-timeout', '3',
+        '--health-stable-sec', '1',
+      ],
+      ROOT_DIR,
+      {
+        PRINTELLECT_TEST_SYSTEMD: '1',
+        PREPEND_PATH: mock.mockBinDir,
+        MOCK_HEALTH_MODE: 'healthy',
+      }
+    );
+    assert.equal(cutoverRes.status, 0, `Cutover failed: ${cutoverRes.stderr}\n${cutoverRes.stdout}`);
+    assert.match(cutoverRes.stdout, /Detected Node\.js runtime:.*runtime\/current\/bin\/node/);
+    assert.match(cutoverRes.stdout, /Health-check gate PASSED/);
+
+    // Verify 10-runtime.conf was generated with staged Node 24
+    const dropinPath = path.join(caseRoot, 'etc', 'systemd', 'system', 'printellect.service.d', '10-runtime.conf');
+    assert.equal(fs.existsSync(dropinPath), true, 'Runtime drop-in must exist');
+    const dropinContent = fs.readFileSync(dropinPath, 'utf8');
+    assert.match(dropinContent, /ExecStart=\/opt\/printellect\/runtime\/current\/bin\/node \/opt\/printellect\/current\/index\.js/);
+
+    // Verify /usr/bin/node was NEVER overwritten (still returns v20.19.2)
+    const eolReadback = fs.readFileSync(eolNodeBin, 'utf8');
+    assert.match(eolReadback, /v20\.19\.2/);
+
+    // 5. Execute rollback -> verifies legacy restored and dropin removed with zero Node.js downgrade
+    const rollbackRes = runInstaller(
+      ['--root-dir', relRoot, '--rollback'],
+      ROOT_DIR,
+      {
+        PRINTELLECT_TEST_SYSTEMD: '1',
+        PREPEND_PATH: mock.mockBinDir,
+      }
+    );
+    assert.equal(rollbackRes.status, 0, `Rollback failed: ${rollbackRes.stderr}\n${rollbackRes.stdout}`);
+    assert.equal(fs.existsSync(dropinPath), false, 'Runtime drop-in must be cleaned up on rollback');
+
+    // Check systemctl calls
+    const commandsLog = fs.readFileSync(path.join(mock.mockStateDir, 'commands.log'), 'utf8');
+    assert.match(commandsLog, /enable printellect-kiosk\.service/);
+    assert.match(commandsLog, /start printellect-kiosk\.service/);
+
+    // Verify /usr/bin/node is still untouched v20.19.2
+    assert.equal(fs.readFileSync(eolNodeBin, 'utf8'), '#!/usr/bin/env bash\necho "v20.19.2"\n');
+  });
 });

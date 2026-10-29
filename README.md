@@ -52,20 +52,34 @@ Every production release bundle consists of:
   -----END PUBLIC KEY-----
   ```
 
-### Trust-Anchor Boundary
-`scripts/bootstrap.sh` embeds `DEFAULT_PUBLIC_KEY` (matching `keys/release-key.pub.pem`) to authenticate `manifest.json` before reading any manifest field or extracting any archive byte. Because `bootstrap.sh` carries that trust anchor, **always verify `SHA256SUMS` (and confirm `DEFAULT_PUBLIC_KEY` inside `bootstrap.sh`) before executing `sudo bash bootstrap.sh`**. Never pipe unverified HTTP URLs into `sudo bash`.
+### Cryptographic Trust Chain
+The security of the release relies on an independent, four-link cryptographic trust chain:
+1. **Independent Trust Anchor**: The official public key (`keys/release-key.pub.pem`), embedded directly in `scripts/bootstrap.sh` as `DEFAULT_PUBLIC_KEY`. This key MUST be obtained from an independently trusted source (e.g., cloned directly from the official authenticated repository or transferred via verified out-of-band channels). **Never trust a public key or `SHA256SUMS` file downloaded alongside release artifacts from an untrusted mirror or CDN**, as an attacker with write access to that mirror could serve their own key and validly sign malicious artifacts.
+2. **Signed Manifest**: The `manifest.json.sig` is an Ed25519 signature over `manifest.json`, verified against the trusted public key.
+3. **Archive Integrity**: The signed `manifest.json` contains `archive.sha256` and `archive.sizeBytes`. `bootstrap.sh` verifies that `printellect-kiosk-daemon-<version>.tar.gz` matches both values before unpacking.
+4. **Per-File Content Integrity & Allowlist**: The signed manifest contains a `sourceFiles` SHA-256 map for every source file. Unpacking occurs into an isolated verification directory where every file's hash is re-checked against `manifest.sourceFiles`, tar headers are checked for directory traversal, hardlinks, symlinks, or unauthorized files, and any mismatch aborts the installation before modifying system state.
+
+### Guarded `--pubkey` Override & Safe Key Rotation
+- **Default Production Invocations**: Standard production commands MUST omit `--pubkey`. `bootstrap.sh` automatically uses the pinned production public key.
+- **`--pubkey` Guard**: If `--pubkey <FILE>` is provided, `bootstrap.sh` normalizes and compares it against the pinned key. If it does not match, `bootstrap.sh` immediately aborts (`TRUST ANCHOR VIOLATION`) unless `--allow-untrusted-pubkey` is explicitly passed. This prevents accidentally overriding the pinned trust anchor during production deployments.
+- **Key Separation**: Test keys used in automated suites are generated ephemerally in temporary directories and never share cryptographic material with the production key.
+- **Safe Key-Rotation Procedure**:
+  When rotating the production signing key:
+  1. *Stage 1 (Key Distribution)*: Update `keys/release-key.pub.pem` and the embedded `DEFAULT_PUBLIC_KEY` in `scripts/bootstrap.sh` in the codebase. Sign this transition release with the **existing** private key. Deploy this update across the kiosk fleet using the existing key.
+  2. *Stage 2 (Key Cutover)*: Once all kiosks have the updated `bootstrap.sh` trust anchor, subsequent releases are signed with the **new** private key.
 
 ### Offline / Pre-Transfer Verification Commands
 ```bash
-# 1. Verify bundle SHA-256 checksums
+# 1. [READ-ONLY] Verify bundle SHA-256 checksums
 sha256sum -c SHA256SUMS
 
-# 2. Verify Ed25519 manifest signature directly with OpenSSL
+# 2. [READ-ONLY] Verify Ed25519 manifest signature directly with OpenSSL using pinned public key
 openssl pkeyutl -verify -pubin -inkey release-key.pub.pem \
   -rawin -in manifest.json -sigfile manifest.json.sig
 
-# 3. Run full Node.js release & per-file archive verifier (add --check-workspace inside git repo)
-node scripts/verify-release.js dist/manifest.json dist/manifest.json.sig keys/release-key.pub.pem --check-workspace
+# 3. [READ-ONLY] Run full Node.js release & per-file archive verifier against pinned key
+#    (Defaults to keys/release-key.pub.pem; add --check-workspace inside git repo)
+node scripts/verify-release.js dist/manifest.json dist/manifest.json.sig --check-workspace
 ```
 
 ---
@@ -87,35 +101,42 @@ Before starting a maintenance window on the Raspberry Pi, confirm all items belo
 
 ## 5. Step-by-Step Raspberry Pi Deployment & Migration Procedure
 
-### Step 1 — Read-Only Release & Host Preflight (Zero Mutation)
+### Step 1 — Read-Only Release & Host Preflight
+> **State Impact**: `[READ-ONLY]` — Zero modifications to filesystem, packages, or services.
 ```bash
 cd /tmp/printellect-release
+
+# 1a. [READ-ONLY] Verify release archive and helper script checksums
 sha256sum -c SHA256SUMS
+
+# 1b. [READ-ONLY] Verify Ed25519 signature of the manifest using pinned public key
 openssl pkeyutl -verify -pubin -inkey release-key.pub.pem \
   -rawin -in manifest.json -sigfile manifest.json.sig
 
-# Dry-run bootstrap verification (session ID is masked in output; zero files/services modified)
+# 1c. [READ-ONLY] Dry-run bootstrap verification
+#     (Verifies prerequisites, disk space, and release integrity against pinned public key; session ID is masked in logs)
 sudo bash ./bootstrap.sh \
   --session-id "<KIOSK_SESSION_ID>" \
   --local-release-dir . \
-  --pubkey ./release-key.pub.pem \
   --skip-printer-setup \
   --dry-run
 ```
 
-### Step 2 — Stage Official Node.js 24 LTS Side-by-Side & Validate Legacy Service (`/usr/bin/node` Untouched)
+### Step 2 — Stage Official Node.js 24 LTS Side-by-Side & Validate Legacy Service
+> **State Impact**: `[MUTATES SYSTEM STATE]` (2a: writes `/opt/printellect/runtime/node-v24.14.0-linux-arm64` and updates `/opt/printellect/runtime/current` symlink; leaves `/usr/bin/node` untouched).
+> (2b: `[READ-ONLY]` dry-run. 2c: `[MUTATES SYSTEM STATE]` applies temporary canary drop-in `99-printellect-node24-canary.conf`, restarts legacy service temporarily for health validation, and restores baseline configuration upon completion).
 ```bash
-# 2a. Stage official Linux ARM64 Node.js 24 LTS under /opt/printellect/runtime/current
-#     (For offline air-gapped install, pass --tarball ./node-v24.14.0-linux-arm64.tar.xz --shasums ./SHASUMS256.txt)
+# 2a. [MUTATES SYSTEM STATE] Stage official Linux ARM64 Node.js 24 LTS under /opt/printellect/runtime/current
+#     (Leaves /usr/bin/node and system apt packages completely untouched)
 sudo bash ./stage-node-runtime.sh \
   --version v24.14.0 \
   --validate-workdir <LEGACY_WORKDIR>
 
-# 2b. Inspect legacy service discovery in dry-run mode (if migrating an existing daemon)
+# 2b. [READ-ONLY] Inspect legacy service discovery in dry-run mode
 sudo bash ./validate-legacy-node24.sh --dry-run --legacy-unit auto
 
-# 2c. Gated single-instance canary test of the existing daemon on staged Node.js 24
-#     (Applies temporary 99-printellect-node24-canary.conf, verifies Firebase + listener + clean stop, and restores baseline)
+# 2c. [MUTATES SYSTEM STATE] Gated single-instance canary test of the existing daemon on staged Node.js 24
+#     (Applies temporary drop-in, tests Firebase + listener + clean stop, and restores original baseline)
 sudo bash ./validate-legacy-node24.sh \
   --run-validation \
   --confirm-restart \
@@ -124,51 +145,52 @@ sudo bash ./validate-legacy-node24.sh \
   --stable-sec 5
 ```
 
-### Step 3 — Stage Signed Release into `/opt/printellect/releases/1.0.0` (Legacy Service Still Running)
+### Step 3 — Stage Signed Release into `/opt/printellect/releases/<ver>`
+> **State Impact**: `[MUTATES SYSTEM STATE]` — Creates `/opt/printellect/releases/<ver>`, runs `npm ci --omit=dev` using staged Node.js 24, updates `/opt/printellect/current` symlink, creates `/usr/local/bin/printellect-setup` symlink, and writes `/etc/printellect/kiosk.env` (`0640`). Live services remain untouched and legacy service continues running.
 ```bash
+# 3a. [MUTATES SYSTEM STATE] Extract and stage release (verifies against pinned public key without --pubkey)
 sudo bash ./bootstrap.sh \
   --session-id "<KIOSK_SESSION_ID>" \
   --local-release-dir . \
-  --pubkey ./release-key.pub.pem \
   --skip-printer-setup
 
-# Validate newly staged release modules and dependencies under staged Node.js 24
+# 3b. [READ-ONLY] Validate newly staged release modules and dependencies under staged Node.js 24
 sudo bash /opt/printellect/current/scripts/stage-node-runtime.sh \
   --validate-only \
   --validate-workdir /opt/printellect/current
 ```
 
-### Step 4 — Upgrade `/usr/bin/node` to Node.js 24 LTS (or Pin Staged Runtime)
-**Option A (Recommended — Upgrade system Node.js to supported 24 LTS so EOL Node.js 20 is retired):**
-```bash
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-sudo apt-get install -y nodejs
-/usr/bin/node -v   # Must report v24.x.x
+### Step 4 — Default Runtime Path: Use Staged Node.js 24 (`/usr/bin/node` Stays Untouched)
+> **State Impact**: `[READ-ONLY]` — No changes.
+>
+> **Preferred Default Path**: The kiosk daemon will run directly using the staged, validated Node.js 24 runtime (`/opt/printellect/runtime/current/bin/node`).
+> - `/usr/bin/node` is **NOT modified**.
+> - No NodeSource apt repositories are installed.
+> - Host global packages remain untouched.
+> - The legacy daemon continues running on its original runtime until cutover.
+> - If rollback is ever required, the legacy service restarts on its original runtime with zero Node.js package downgrade.
+> *(For administrators desiring an optional system-wide upgrade to retire EOL Node.js 20 globally, see Appendix A.)*
 
-# If migrating an active legacy service, confirm clean restart on /usr/bin/node v24 before service cutover:
-sudo systemctl restart <legacy-unit>.service
-sudo systemctl is-active <legacy-unit>.service
-```
-**Option B (Offline / Pinned Runtime — Keep `/usr/bin/node` untouched and pass `--node-bin /opt/printellect/runtime/current/bin/node` to `install-service.sh` in Step 5).**
+### Step 5 — Configure Printers & Execute `systemd` Service Cutover
+> **State Impact**: `[MUTATES SYSTEM STATE]` — 
+> 5a: `[READ-ONLY]` preflight and dry-run.
+> 5b (if clean install): writes `/var/lib/printellect/config.json`.
+> 5c: acquires `/run/printellect-migration.lock`, writes `/var/lib/printellect/backups/`, writes `/etc/printellect/migration.json`, arms `printellect-migration-recover.service`, stops and disables legacy unit, installs `/etc/systemd/system/printellect.service` and `/etc/systemd/system/printellect.service.d/10-runtime.conf` pointing to staged Node 24, enables and starts `printellect.service`, verifies health gate, and disarms recovery unit.
 
-### Step 5 — Configure Printers (Clean Install Only) & Execute `systemd` Service Cutover
-If no legacy `config.json` exists yet, map CUPS queues first:
 ```bash
-sudo printellect-setup --bw Canon_GX6100 --color Canon_GX6100
-```
-
-Run service preflight, dry-run, and cutover:
-```bash
-# 5a. Read-only preflight and dry-run
+# 5a. [READ-ONLY] Run installer preflight and dry-run
 sudo bash /opt/printellect/current/scripts/install-service.sh --preflight-only --migrate-legacy auto
 sudo bash /opt/printellect/current/scripts/install-service.sh --dry-run --migrate-legacy auto --enable --start
 
-# 5b. Execute gated cutover (writes verified backups + /etc/printellect/migration.json, arms
-#     printellect-migration-recover.service, stops/disables legacy unit, installs/enables/starts
-#     printellect.service, enforces PID-scoped Firebase health gate, and disarms recovery unit)
+# 5b. [MUTATES SYSTEM STATE] (Clean Install Only) Configure CUPS printers non-interactively if no config.json exists
+#     (Runs on staged Node.js 24 via bin/printellect-setup launcher)
+sudo printellect-setup --bw Canon_GX6100 --color Canon_GX6100
+
+# 5c. [MUTATES SYSTEM STATE] Execute gated migration cutover
+#     (Automatically detects /opt/printellect/runtime/current/bin/node and generates 10-runtime.conf)
 sudo bash /opt/printellect/current/scripts/install-service.sh --migrate-legacy auto --enable --start
 
-# 5c. Confirm single active daemon running as 'printellect' and completed checkpoint
+# 5d. [READ-ONLY] Confirm single active daemon running as 'printellect' on staged Node 24
 sudo cat /etc/printellect/migration.json
 ps -eo user,pid,cmd | grep '[n]ode'
 ```
@@ -178,18 +200,18 @@ ps -eo user,pid,cmd | grep '[n]ode'
 
 ## 6. Post-Deployment Physical Acceptance Checklist
 
-Execute the CUPS acceptance gate **as the unprivileged `printellect` service user** (substitute `/opt/printellect/runtime/current/bin/node` if using Option B):
+Execute the CUPS acceptance gate **as the unprivileged `printellect` service user** using the staged Node.js 24 runtime:
 
 ```bash
-# 1. Non-printing queue readiness gate (verifies config.json permissions, lpstat -p, and lpstat -a)
-sudo -u printellect /usr/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js --check-queues
+# 1. [READ-ONLY] Non-printing queue readiness gate (verifies config.json permissions, lpstat -p, and lpstat -a)
+sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js --check-queues
 
-# 2. Controlled 1-page B&W grayscale simplex acceptance print (zero fallback; tagged via lp -t)
-sudo -u printellect /usr/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
+# 2. [MUTATES PRINTER] Controlled 1-page B&W grayscale simplex acceptance print (zero fallback; tagged via lp -t)
+sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
   --submit-test-job --role bw --color false --duplex false --copies 1 --generate-test-pdf --wait-completion-sec 45
 
-# 3. Controlled Color RGB duplex acceptance print (use --duplex false if physical queue is simplex-only)
-sudo -u printellect /usr/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
+# 3. [MUTATES PRINTER] Controlled Color RGB duplex acceptance print (use --duplex false if queue is simplex-only)
+sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
   --submit-test-job --role color --color true --duplex true --copies 1 --generate-test-pdf --wait-completion-sec 60
 ```
 
@@ -198,6 +220,9 @@ Verify every item below before closing the maintenance window:
 - [ ] B&W acceptance job reports `Spool Status : cups_spool_completed` and physical sheet exits in **grayscale, 1-sided, 1 copy** with matching `Job Tag : printellect-acceptance-bw-...` printed on the page.
 - [ ] Color acceptance job reports `Spool Status : cups_spool_completed` and physical sheet exits in **RGB color** with expected duplex/simplex behavior.
 - [ ] `lpstat -W not-completed` is empty and `sudo journalctl -u printellect.service -n 50 --no-pager` shows `Connected to Firebase.` + `Listening for print jobs on session: ...` with masked session ID and zero errors.
+- [ ] **Physical Collection-Door Gate**: Because the physical door controller firmware and Firebase Cloud Functions (`kioskDoorCommand` / `kioskDoorAck`) reside outside this repository, perform live hardware validation:
+  1. Submit a paid test print job through the kiosk application. Confirm that upon successful completion, the physical collection door unlocks (`door.command: open`), the user collects the output, and upon door closing, the job transitions to `status: delivered`.
+  2. Verify that an unsuccessful or canceled job transitions to `status: failed` in Firestore and that the physical collection door remains **locked**.
 
 ---
 
@@ -277,4 +302,21 @@ Local CI/WSL2 verification validates Node.js 24 execution, Ed25519/SHA-256 crypt
 | **Canary validation** | `scripts/validate-legacy-node24.sh` | `bash -n` + `test/runtime-staging.test.js` (gated drop-in, crash auto-restore, leftover-drop-in migration block) | PASS | Brief single-service restart (~3–5s) occurs during gated `--confirm-restart` canary window. |
 | **Print acceptance** | `scripts/verify-print-acceptance.js` | `test/print-acceptance.test.js` (`-t` job tag, zero fallback, timeout cancel isolation from unrelated jobs) | PASS | `cups_spool_completed` confirms CUPS filter/backend completion; human visual check of paper output remains mandatory. |
 | **Documentation** | `README.md`, `docs/migration-runbook.md`, `docs/service-architecture.md` | Cross-checked every CLI flag, path, file count (`15` source + `release.json`), and public key against codebase | PASS | Keep runbooks updated whenever future release versions (`>1.0.0`) add new CLI flags or mandatory files. |
+
+---
+
+## Appendix A — Optional System-Wide Node.js Upgrade (Non-Default)
+
+> **POLICY NOTE**: The default deployment path runs `printellect.service` directly against the staged runtime `/opt/printellect/runtime/current/bin/node` and leaves `/usr/bin/node` untouched. Upgrading the system's global `/usr/bin/node` is **NOT required for normal kiosk operation**.
+>
+> If system administrators explicitly wish to retire the EOL Node.js 20 package globally across the entire host OS after successful migration and validation:
+>
+> ```bash
+> # 1. [MUTATES SYSTEM STATE] Add official NodeSource repository and upgrade system Node.js globally
+> curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+> sudo apt-get install -y nodejs
+> /usr/bin/node -v   # Must report v24.x.x
+> ```
+>
+> **Caution**: Performing a global package upgrade mutates host system packages and affects any legacy background scripts relying on global `/usr/bin/node`. If rollback is ever required after a global upgrade, the legacy daemon will execute under the upgraded Node.js 24 runtime unless manually downgraded.
 

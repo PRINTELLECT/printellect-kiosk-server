@@ -26,6 +26,7 @@ const defaultState = {
   pendingColorPages: 0,
   processingJobs: new Set(),
   completedJobs: new Set(),
+  failedJobs: new Set(),
 };
 
 /**
@@ -217,14 +218,39 @@ export function selectTargetPrinter({ isColor, config, state }) {
   };
 }
 
-function recordCompletedJob(completedSet, jobId) {
-  if (completedSet.size >= MAX_COMPLETED_JOBS_CACHE) {
-    const oldest = completedSet.values().next().value;
+function recordTrackedJob(trackedSet, jobId) {
+  if (trackedSet.size >= MAX_COMPLETED_JOBS_CACHE) {
+    const oldest = trackedSet.values().next().value;
     if (oldest !== undefined) {
-      completedSet.delete(oldest);
+      trackedSet.delete(oldest);
     }
   }
-  completedSet.add(jobId);
+  trackedSet.add(jobId);
+}
+
+/**
+ * Retries only the terminal Firestore status update (never re-downloading or re-printing files)
+ * so transient network blips cannot cause duplicate prints or duplicate delivery transitions.
+ */
+async function updateTaskStatusWithRetry(
+  updateDocFn,
+  taskDocRef,
+  payload,
+  { maxAttempts = 3, retryDelayMs = 200 } = {}
+) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await updateDocFn(taskDocRef, payload);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts && retryDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -241,6 +267,16 @@ export async function processJob(jobId, jobData, config, deps = {}) {
   const fetchImpl = deps.fetch || fetch;
   const tempDir = deps.tempDir || os.tmpdir();
   const state = deps.state || defaultState;
+  const failedJobs = state.failedJobs || (state.failedJobs = new Set());
+  const statusRetryOpts = {
+    maxAttempts: deps.statusMaxAttempts ?? 3,
+    retryDelayMs: deps.statusRetryDelayMs ?? 200,
+  };
+
+  if (state.completedJobs.has(jobId) || failedJobs.has(jobId)) {
+    state.processingJobs.delete(jobId);
+    return { outcome: 'duplicate_ignored', printedFiles: 0, totalFiles: 0 };
+  }
 
   try {
     const taskDocRef = docFn(firestoreDb, 'tasks', jobId);
@@ -249,11 +285,17 @@ export async function processJob(jobId, jobData, config, deps = {}) {
 
     if (filesSnap.empty || !filesSnap.docs || filesSnap.docs.length === 0) {
       console.error(`[ERROR] No printable files found in tasks/${jobId}/files. Marking job failed.`);
-      await updateDocFn(taskDocRef, {
-        status: 'failed',
-        'failed-time': new Date(),
-        'failure-reason': 'No printable files found in task subcollection',
-      });
+      recordTrackedJob(failedJobs, jobId);
+      await updateTaskStatusWithRetry(
+        updateDocFn,
+        taskDocRef,
+        {
+          status: 'failed',
+          'failed-time': new Date(),
+          'failure-reason': 'No printable files found in task subcollection',
+        },
+        statusRetryOpts
+      );
       state.processingJobs.delete(jobId);
       return { outcome: 'failed', reason: 'empty_files', printedFiles: 0, totalFiles: 0 };
     }
@@ -418,13 +460,19 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       console.error(
         `[JOB FAILED] Job ${jobId} did not complete (${succeededFiles}/${filesSnap.docs.length} file(s) printed): ${reasonSummary}`
       );
-      await updateDocFn(taskDocRef, {
-        status: 'failed',
-        'failed-time': new Date(),
-        'failure-reason': reasonSummary,
-        'printed-files': succeededFiles,
-        'total-files': filesSnap.docs.length,
-      });
+      recordTrackedJob(failedJobs, jobId);
+      await updateTaskStatusWithRetry(
+        updateDocFn,
+        taskDocRef,
+        {
+          status: 'failed',
+          'failed-time': new Date(),
+          'failure-reason': reasonSummary,
+          'printed-files': succeededFiles,
+          'total-files': filesSnap.docs.length,
+        },
+        statusRetryOpts
+      );
       state.processingJobs.delete(jobId);
       return {
         outcome: 'failed',
@@ -435,7 +483,7 @@ export async function processJob(jobId, jobData, config, deps = {}) {
     }
 
     // All files printed successfully -> record completed before Firestore ack to prevent duplicate re-print
-    recordCompletedJob(state.completedJobs, jobId);
+    recordTrackedJob(state.completedJobs, jobId);
 
     const collectionTrays = [];
     if (printedOnBw) collectionTrays.push('Tray 1');
@@ -451,11 +499,16 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       `\n🎉 [KIOSK OUTPUT] Job ${jobId} finished! Collection Tray(s): ${collectionTrays.join(' and ')}`
     );
 
-    await updateDocFn(taskDocRef, {
-      status: 'completed',
-      'completed-time': new Date(),
-      'collection-trays': collectionTrays,
-    });
+    await updateTaskStatusWithRetry(
+      updateDocFn,
+      taskDocRef,
+      {
+        status: 'completed',
+        'completed-time': new Date(),
+        'collection-trays': collectionTrays,
+      },
+      statusRetryOpts
+    );
     state.processingJobs.delete(jobId);
     console.log(`Updated job ${jobId} status to completed with collection-trays.`);
 
@@ -573,7 +626,12 @@ export async function startDaemon(deps = {}) {
 
         // Strict payment confirmation & outlet gate: ONLY process paid 'on-queue' jobs assigned a shopid
         if (jobData.status === 'on-queue' && Boolean(jobData.shopid)) {
-          if (state.processingJobs.has(jobId) || state.completedJobs.has(jobId)) {
+          const failedJobs = state.failedJobs || (state.failedJobs = new Set());
+          if (
+            state.processingJobs.has(jobId) ||
+            state.completedJobs.has(jobId) ||
+            failedJobs.has(jobId)
+          ) {
             continue;
           }
           state.processingJobs.add(jobId);

@@ -275,13 +275,167 @@ const isDirectExecution = process.argv[1] && (
   process.argv[1].endsWith('setup.js')
 );
 
+/**
+ * Parses CLI arguments for non-interactive printer role assignment or diagnostic queries.
+ * @param {string[]} argv
+ * @returns {object}
+ */
+export function parseSetupCliArgs(argv = process.argv.slice(2)) {
+  const options = {
+    bwQueue: undefined,
+    colorQueue: undefined,
+    configPath: undefined,
+    skipVerifyQueues: false,
+    list: false,
+    help: false,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--bw') {
+      if (!argv[i + 1]) throw new Error('Option --bw requires a queue name (or "none").');
+      options.bwQueue = argv[++i];
+    } else if (arg === '--color') {
+      if (!argv[i + 1]) throw new Error('Option --color requires a queue name (or "none").');
+      options.colorQueue = argv[++i];
+    } else if (arg === '--config-path') {
+      if (!argv[i + 1]) throw new Error('Option --config-path requires a destination path.');
+      options.configPath = argv[++i];
+    } else if (arg === '--skip-verify-queues') {
+      options.skipVerifyQueues = true;
+    } else if (arg === '--list') {
+      options.list = true;
+    } else if (arg === '-h' || arg === '--help') {
+      options.help = true;
+    } else {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+  }
+
+  return options;
+}
+
+/**
+ * Runs the printer setup CLI:
+ * - If `--help`, prints usage.
+ * - If `--list`, queries and lists detected system printer queues.
+ * - If `--bw` or `--color` is provided, non-interactively validates and saves configuration.
+ * - If no flags are provided, launches the interactive wizard.
+ *
+ * @param {string[]} [argv]
+ * @param {object} [options]
+ * @returns {Promise<{ success: boolean, config?: object, configPath?: string, cancelled?: boolean, mode?: string, errors?: string[] }>}
+ */
+export async function runSetupCli(argv = process.argv.slice(2), options = {}) {
+  const printerProvider = options.printerProvider || getPrinters;
+  const targetPath = options.targetPath || getConfigPath();
+  const output = options.output || process.stdout;
+  const log = (msg = '') => output.write(`${msg}\n`);
+
+  let parsed;
+  try {
+    parsed = parseSetupCliArgs(argv);
+  } catch (err) {
+    log(`[ERROR] ${err.message}`);
+    return { success: false, errors: [err.message] };
+  }
+
+  if (parsed.help) {
+    log('PRINTELLECT Kiosk Server — Printer Configuration Tool\n');
+    log('Usage:');
+    log('  sudo printellect-setup [OPTIONS]\n');
+    log('Options:');
+    log('  --bw <QUEUE|none>        Assign queue name for Black & White jobs');
+    log('  --color <QUEUE|none>     Assign queue name for Color jobs');
+    log('  --config-path <PATH>     Destination config path (default: /var/lib/printellect/config.json)');
+    log('  --skip-verify-queues     Skip verifying queue existence against live CUPS / system printers');
+    log('  --list                   List detected CUPS / system printers and exit');
+    log('  -h, --help               Show this help message\n');
+    log('Examples:');
+    log('  # Single color multifunction printer handling both B&W and Color');
+    log('  sudo printellect-setup --bw Canon_GX6100 --color Canon_GX6100\n');
+    log('  # Interactive terminal wizard');
+    log('  sudo printellect-setup');
+    return { success: true, mode: 'help' };
+  }
+
+  if (parsed.list) {
+    log('Scanning for available printers via CUPS / system drivers...');
+    const printers = await printerProvider();
+    if (!printers || printers.length === 0) {
+      log('No printers detected.');
+    } else {
+      log(`Detected ${printers.length} printer(s):`);
+      printers.forEach((p, idx) => {
+        const name = p.name || p;
+        const status = p.status ? ` (Status: ${p.status})` : '';
+        log(`  [${idx + 1}] ${name}${status}`);
+      });
+    }
+    return { success: true, mode: 'list', printers };
+  }
+
+  // Non-interactive assignment mode
+  if (parsed.bwQueue !== undefined || parsed.colorQueue !== undefined) {
+    const normalizeQueue = (val) => {
+      if (val === undefined || val === null) return null;
+      const trimmed = String(val).trim();
+      if (!trimmed || /^(none|skip|null|disabled)$/i.test(trimmed)) return null;
+      return trimmed;
+    };
+
+    const finalBw = normalizeQueue(parsed.bwQueue);
+    const finalColor = normalizeQueue(parsed.colorQueue);
+
+    let configToSave;
+    if (parsed.skipVerifyQueues) {
+      const valRes = validateConfig({ bwPrinter: finalBw, colorPrinter: finalColor });
+      if (!valRes.valid) {
+        log(`\n❌ Configuration Error: ${valRes.errors.join(' ')}\n`);
+        return { success: false, errors: valRes.errors };
+      }
+      configToSave = { bwPrinter: finalBw, colorPrinter: finalColor };
+    } else {
+      log('Querying available printers via CUPS...');
+      const availablePrinters = await printerProvider();
+      const buildRes = buildPrinterConfiguration({
+        availablePrinters,
+        bwQueue: finalBw,
+        colorQueue: finalColor,
+      });
+      if (!buildRes.valid) {
+        log(`\n❌ Configuration Error: ${buildRes.errors.join(' ')}\n`);
+        return { success: false, errors: buildRes.errors };
+      }
+      configToSave = buildRes.config;
+    }
+
+    const savePath = parsed.configPath || targetPath;
+    saveConfig(configToSave, savePath);
+
+    log(`\n✅ Configuration successfully saved to: ${savePath}`);
+    log(`  Black & White Printer : ${configToSave.bwPrinter || '(None / Disabled)'}`);
+    log(`  Color Printer         : ${configToSave.colorPrinter || '(None / Disabled)'}\n`);
+
+    return {
+      success: true,
+      config: configToSave,
+      configPath: savePath,
+      mode: 'non-interactive',
+    };
+  }
+
+  // Fall back to interactive wizard
+  return runSetupWizard({ ...options, targetPath });
+}
+
 if (isDirectExecution) {
-  runSetupWizard()
+  runSetupCli()
     .then((result) => {
       process.exit(result.success ? 0 : 1);
     })
     .catch((err) => {
-      console.error('\n[FATAL ERROR] Wizard failed unexpectedly:', err);
+      console.error('\n[FATAL ERROR] Printer setup failed unexpectedly:', err);
       process.exit(1);
     });
 }
@@ -289,4 +443,6 @@ if (isDirectExecution) {
 export default {
   buildPrinterConfiguration,
   runSetupWizard,
+  parseSetupCliArgs,
+  runSetupCli,
 };

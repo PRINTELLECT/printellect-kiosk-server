@@ -1,17 +1,35 @@
-#!/usr/bin/env node
+#!/usr/bin/env bash
 
-/**
- * PRINTELLECT Kiosk Server — Standalone Printer Setup CLI
- */
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { runSetupWizard } from '../setup.js';
+# ==============================================================================
+# PRINTELLECT Kiosk Server — Standalone Printer Setup Launcher
+#
+# Resolves the versioned / staged Node.js 24 runtime without modifying /usr/bin/node
+# and invokes setup.js with forwarded arguments.
+# ==============================================================================
 
-runSetupWizard()
-  .then((result) => {
-    process.exit(result.success ? 0 : 1);
-  })
-  .catch((err) => {
-    console.error('\n[FATAL ERROR] Printer setup failed:', err.message);
-    process.exit(1);
-  });
+set -euo pipefail
+
+SELF_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  RESOLVED="$(readlink -f "${SELF_PATH}" 2>/dev/null || true)"
+  [[ -n "${RESOLVED}" ]] && SELF_PATH="${RESOLVED}"
+fi
+
+BIN_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
+RELEASE_DIR="$(cd "${BIN_DIR}/.." && pwd)"
+BASE_DIR="$(cd "${RELEASE_DIR}/../.." 2>/dev/null && pwd || true)"
+
+# Prefer staged Node.js 24 runtime under /opt/printellect/runtime/current/bin/node
+NODE_EXEC=""
+if [[ -n "${BASE_DIR}" && -x "${BASE_DIR}/runtime/current/bin/node" ]]; then
+  NODE_EXEC="${BASE_DIR}/runtime/current/bin/node"
+elif [[ -x "/opt/printellect/runtime/current/bin/node" ]]; then
+  NODE_EXEC="/opt/printellect/runtime/current/bin/node"
+elif command -v node >/dev/null 2>&1; then
+  NODE_EXEC="$(command -v node)"
+else
+  echo "[FATAL ERROR] Node.js executable not found in /opt/printellect/runtime/current/bin/node or in PATH." >&2
+  exit 1
+fi
+
+exec "${NODE_EXEC}" "${RELEASE_DIR}/setup.js" "$@"

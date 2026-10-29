@@ -9,12 +9,14 @@
 # systemd services (service cutover is strictly gated in install-service.sh).
 #
 # TRUST-ANCHOR BOUNDARY:
-#   This script embeds DEFAULT_PUBLIC_KEY (matching keys/release-key.pub.pem) to
-#   verify manifest.json + manifest.json.sig via Ed25519 before trusting any
-#   manifest field or extracting any archive byte. Because bootstrap.sh itself
-#   carries that trust anchor, operators MUST verify bootstrap.sh against the
-#   out-of-band SHA256SUMS digest (or confirm DEFAULT_PUBLIC_KEY matches the
-#   pinned public key fingerprint) before invoking 'sudo bash bootstrap.sh'.
+#   This script embeds DEFAULT_PUBLIC_KEY (matching keys/release-key.pub.pem) as
+#   the pinned production trust anchor to verify manifest.json + manifest.json.sig
+#   via Ed25519 before trusting any manifest field or extracting any archive byte.
+#   Never trust a public key or SHA256SUMS file merely because it was downloaded
+#   from the same release URL as the archive. Operators MUST obtain or verify
+#   bootstrap.sh (and its embedded DEFAULT_PUBLIC_KEY) from an independently
+#   trusted source (e.g., audited Git tag checkout or out-of-band SHA-256 digest)
+#   and invoke production bootstrap WITHOUT --pubkey.
 #   Never pipe unverified HTTP content directly into 'sudo bash'.
 #
 # Supported OS: Debian GNU/Linux 11, 12, 13, Raspbian / Raspberry Pi OS
@@ -23,11 +25,11 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 MIN_FREE_DISK_MB=250
 
 # Embedded official public key (Ed25519) — matches keys/release-key.pub.pem
-# Can be overridden explicitly with --pubkey <path> for isolated development testing
+# Non-matching --pubkey overrides are rejected unless --allow-untrusted-pubkey is explicitly passed
 DEFAULT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAYgGBLvQx7mUYr8rB0v21gNBFZ/V1MDjuxyc74XWRzJw=
 -----END PUBLIC KEY-----"
@@ -39,6 +41,7 @@ TARGET_VERSION=""
 RELEASE_URL=""
 LOCAL_RELEASE_DIR=""
 CUSTOM_PUBKEY=""
+ALLOW_UNTRUSTED_PUBKEY=false
 SKIP_PRINTER_SETUP=false
 SKIP_NPM_CI=false
 INSTALL_SYSTEM_NODE=false
@@ -61,7 +64,8 @@ Options:
   --release-url <URL>         HTTPS base URL to fetch release artifacts (manifest, signature, archive)
   --allow-insecure-http       Allow http:// --release-url (isolated local test harnesses only)
   --local-release-dir <DIR>   Path to local directory with release artifacts (offline/recommended)
-  --pubkey <FILE>             Path to Ed25519 public key file to verify release signature
+  --pubkey <FILE>             Path to Ed25519 public key file (must match pinned key unless --allow-untrusted-pubkey)
+  --allow-untrusted-pubkey    Permit non-production --pubkey override (isolated testing / key-rotation drill ONLY)
   --install-system-node       Authorize installing Node.js 24 LTS via NodeSource apt if not pre-staged
   --skip-printer-setup        Do not launch interactive printer setup wizard during installation
   --skip-npm-ci               Skip 'npm ci --omit=dev' (for isolated offline filesystem staging tests)
@@ -128,6 +132,10 @@ while [[ $# -gt 0 ]]; do
       require_arg_value "$1" "$#" "${2:-}"
       CUSTOM_PUBKEY="$2"
       shift 2
+      ;;
+    --allow-untrusted-pubkey)
+      ALLOW_UNTRUSTED_PUBKEY=true
+      shift
       ;;
     --install-system-node)
       INSTALL_SYSTEM_NODE=true
@@ -373,19 +381,37 @@ chmod 0700 "${TEMP_DIR}"
 
 MANIFEST_FILE="${TEMP_DIR}/manifest.json"
 SIG_FILE="${TEMP_DIR}/manifest.json.sig"
+PINNED_PUBKEY_FILE="${TEMP_DIR}/pinned-release-key.pub.pem"
 PUBKEY_FILE="${TEMP_DIR}/release-key.pub.pem"
+printf '%s\n' "${DEFAULT_PUBLIC_KEY}" > "${PINNED_PUBKEY_FILE}"
 
-# Setup public key for verification
+normalize_pem_key() {
+  grep -v '^-----' "$1" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# Setup public key for verification (enforcing pinned production trust anchor by default)
 if [[ -n "${CUSTOM_PUBKEY}" ]]; then
   if [[ ! -f "${CUSTOM_PUBKEY}" ]]; then
     fatal "Specified custom public key file not found: ${CUSTOM_PUBKEY}"
   fi
-  warn "SECURITY NOTICE: Custom public key specified (${CUSTOM_PUBKEY})."
-  warn "This override is intended for testing and development only."
-  cp "${CUSTOM_PUBKEY}" "${PUBKEY_FILE}"
+  PINNED_KEY_BODY="$(normalize_pem_key "${PINNED_PUBKEY_FILE}")"
+  CUSTOM_KEY_BODY="$(normalize_pem_key "${CUSTOM_PUBKEY}")"
+  if [[ -z "${CUSTOM_KEY_BODY}" ]]; then
+    fatal "Specified --pubkey file (${CUSTOM_PUBKEY}) does not contain a valid PEM public key."
+  fi
+  if [[ "${CUSTOM_KEY_BODY}" == "${PINNED_KEY_BODY}" ]]; then
+    log "Specified --pubkey matches pinned official production public key."
+    cp "${PINNED_PUBKEY_FILE}" "${PUBKEY_FILE}"
+  elif [[ "${ALLOW_UNTRUSTED_PUBKEY}" == "true" ]]; then
+    warn "SECURITY OVERRIDE ACTIVE (--allow-untrusted-pubkey): Bypassing pinned production trust anchor with custom key (${CUSTOM_PUBKEY})."
+    warn "This override is strictly for isolated test harnesses or an authorized key-rotation drill."
+    cp "${CUSTOM_PUBKEY}" "${PUBKEY_FILE}"
+  else
+    fatal "TRUST ANCHOR VIOLATION: Custom --pubkey (${CUSTOM_PUBKEY}) does not match the pinned official production public key! Downloading or supplying an unpinned public key alongside a release bypasses signature verification. Omit --pubkey for production deployments (or pass --allow-untrusted-pubkey ONLY in isolated development/testing)."
+  fi
 else
-  printf '%s\n' "${DEFAULT_PUBLIC_KEY}" > "${PUBKEY_FILE}"
-  log "Using embedded official public key."
+  cp "${PINNED_PUBKEY_FILE}" "${PUBKEY_FILE}"
+  log "Using pinned official production public key."
 fi
 
 # 7. Fetch release manifest and signature
