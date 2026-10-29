@@ -713,6 +713,11 @@ EOF
   update_migration_checkpoint "rolled_back" "${final_rb_phase}" "${rollback_reason}"
   disarm_boot_recovery_unit
 
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_FILE}" >/dev/null 2>&1 || true
+    chmod 0640 "${CONFIG_FILE}" >/dev/null 2>&1 || true
+  fi
+
   echo ""
   echo "=========================================================="
   echo "   ROLLBACK COMPLETED SUCCESSFULLY                        "
@@ -1377,13 +1382,14 @@ log "Setting up directory permissions..."
 if [[ "${DRY_RUN}" == "true" ]]; then
   log "[DRY RUN] Would provision ${BASE_DIR} (0755 root), ${CONFIG_DIR} (0750 ${SERVICE_USER}), ${ENV_DIR} (0750 root:${SERVICE_GROUP}), ${BACKUP_DIR} (0700)"
 else
-  mkdir -p "${BASE_DIR}" "${CONFIG_DIR}" "${BACKUP_DIR}" "${ENV_DIR}" "${SYSTEMD_DIR}"
+  mkdir -p "${BASE_DIR}" "${CONFIG_DIR}" "${CONFIG_DIR}/jobs" "${BACKUP_DIR}" "${ENV_DIR}" "${SYSTEMD_DIR}"
 
   chown -R root:root "${BASE_DIR}" >/dev/null 2>&1 || true
   chmod 0755 "${BASE_DIR}"
 
   chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_DIR}" >/dev/null 2>&1 || true
   chmod 0750 "${CONFIG_DIR}"
+  chmod 0750 "${CONFIG_DIR}/jobs" >/dev/null 2>&1 || true
 
   chown root:"${SERVICE_GROUP}" "${ENV_DIR}" >/dev/null 2>&1 || true
   chmod 0750 "${ENV_DIR}"
@@ -1416,12 +1422,14 @@ if [[ ! -f "${CONFIG_FILE}" && -n "${RESOLVED_LEGACY_WORKDIR}" && -f "${RESOLVED
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "[DRY RUN] Would copy ${RESOLVED_LEGACY_WORKDIR}/config.json -> ${CONFIG_FILE}"
   else
-    atomic_install_file "${RESOLVED_LEGACY_WORKDIR}/config.json" "${CONFIG_FILE}" 0644
+    atomic_install_file "${RESOLVED_LEGACY_WORKDIR}/config.json" "${CONFIG_FILE}" 0640
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_FILE}" >/dev/null 2>&1 || true
-    log "Preserved and migrated existing printer configuration."
+    log "Preserved and migrated existing printer configuration (mode 0640, ${SERVICE_USER}:${SERVICE_GROUP})."
   fi
 elif [[ -f "${CONFIG_FILE}" ]]; then
-  log "Existing persistent configuration preserved at ${CONFIG_FILE}."
+  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_FILE}" >/dev/null 2>&1 || true
+  chmod 0640 "${CONFIG_FILE}" >/dev/null 2>&1 || true
+  log "Existing persistent configuration preserved at ${CONFIG_FILE} (mode 0640, ${SERVICE_USER}:${SERVICE_GROUP})."
 fi
 
 # ==============================================================================

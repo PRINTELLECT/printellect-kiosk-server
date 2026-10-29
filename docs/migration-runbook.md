@@ -119,9 +119,9 @@ systemctl list-units --type=service | grep -iE '(printellect|kiosk)'
 /usr/bin/node -v
 
 # 2. [READ-ONLY] Verify signed release bundle in read-only dry-run mode
-#    (Automatically authenticates against pinned public key; session ID masked in output)
+#    (Automatically authenticates against pinned public key; session ID is auto-discovered or can be passed via --session-id)
 cd /tmp/printellect-preflight
-sudo bash bootstrap.sh --session-id "<KIOSK_SESSION_ID>" --local-release-dir ./dist --skip-printer-setup --dry-run
+sudo bash bootstrap.sh --release-dir ./dist --version 1.0.2 --skip-printer-setup --dry-run
 ```
 - **Abort Criteria**: Architecture != `aarch64`, free disk < `250 MB`, `cups` inactive, CUPS queues disabled/rejecting jobs, multiple ambiguous legacy kiosk units running, active print jobs in queue, or `bootstrap.sh --dry-run` cryptographic signature/checksum failure.
 
@@ -130,12 +130,12 @@ sudo bash bootstrap.sh --session-id "<KIOSK_SESSION_ID>" --local-release-dir ./d
 ### Phase II — Side-by-Side Node.js 24 Staging & Gated Legacy Daemon Validation (`/usr/bin/node` Untouched)
 *(Execute only after cutover window authorization.)*
 > **State Impact**: 
-> 1: `[MUTATES SYSTEM STATE]` extracts `/opt/printellect/runtime/current` and versioned directory; leaves `/usr/bin/node` untouched.
+> 1: `[FILESYSTEM MUTATION]` extracts `/opt/printellect/runtime/current` and versioned directory; leaves `/usr/bin/node` untouched.
 > 2: `[READ-ONLY]` dry-run.
-> 3: `[MUTATES SYSTEM STATE]` applies temporary drop-in `99-printellect-node24-canary.conf`, restarts legacy daemon, validates health, and restores baseline on exit.
+> 3: `[SERVICE MUTATION]` applies temporary drop-in `99-printellect-node24-canary.conf`, restarts legacy daemon, validates health, and restores baseline on exit.
 
 ```bash
-# 1. [MUTATES SYSTEM STATE] Stage official Node.js 24 LTS into /opt/printellect/runtime/current (verifies SHA-256; /usr/bin/node untouched)
+# 1. [FILESYSTEM MUTATION] Stage official Node.js 24 LTS into /opt/printellect/runtime/current (verifies SHA-256; /usr/bin/node untouched)
 sudo bash /tmp/printellect-preflight/stage-node-runtime.sh \
   --version v24.14.0 \
   --validate-workdir <LEGACY_WORKDIR>
@@ -143,7 +143,7 @@ sudo bash /tmp/printellect-preflight/stage-node-runtime.sh \
 # 2. [READ-ONLY] Dry-run legacy canary inspection
 sudo bash /tmp/printellect-preflight/validate-legacy-node24.sh --dry-run --legacy-unit auto
 
-# 3. [MUTATES SYSTEM STATE] Execute gated single-instance validation of the live legacy daemon on staged Node.js 24
+# 3. [SERVICE MUTATION] Execute gated single-instance validation of the live legacy daemon on staged Node.js 24
 #    (Temporarily applies 99-printellect-node24-canary.conf, verifies Firebase + listener + clean stop, and restores baseline)
 sudo bash /tmp/printellect-preflight/validate-legacy-node24.sh \
   --run-validation \
@@ -157,13 +157,13 @@ sudo bash /tmp/printellect-preflight/validate-legacy-node24.sh \
 ---
 
 ### Phase III — Release Staging via `bootstrap.sh` (Live Legacy Service Still Running Untouched)
-> **State Impact**: `[MUTATES SYSTEM STATE]` — Creates `/opt/printellect/releases/<ver>`, runs `npm ci --omit=dev` via staged Node 24, links `/opt/printellect/current`, creates `/usr/local/bin/printellect-setup`, writes `/etc/printellect/kiosk.env` (`0640`). Live legacy daemon remains untouched and active.
+> **State Impact**: `[FILESYSTEM MUTATION]` — Creates `/opt/printellect/releases/<ver>`, runs `npm ci --omit=dev` via staged Node 24, links `/opt/printellect/current`, creates `/usr/local/bin/printellect-setup`, writes `/etc/printellect/kiosk.env` (`0640`). Live legacy daemon remains untouched and active.
 
 ```bash
-# 1. [MUTATES SYSTEM STATE] Extract verified release to /opt/printellect/releases/<ver> (authenticates with pinned key)
+# 1. [FILESYSTEM MUTATION] Extract verified release to /opt/printellect/releases/<ver> (authenticates with pinned key)
 sudo bash /tmp/printellect-preflight/bootstrap.sh \
-  --session-id "<KIOSK_SESSION_ID>" \
-  --local-release-dir /tmp/printellect-preflight/dist \
+  --release-dir /tmp/printellect-preflight/dist \
+  --version 1.0.2 \
   --skip-printer-setup
 
 # 2. [READ-ONLY] Validate extracted release modules under staged Node.js 24
@@ -188,21 +188,21 @@ sudo bash /opt/printellect/current/scripts/stage-node-runtime.sh \
 ---
 
 ### Phase V — Systemd Service Cutover (`install-service.sh`)
-> **State Impact**: `[MUTATES SYSTEM STATE]` —
+> **State Impact**:
 > 1: `[READ-ONLY]` preflight and dry-run.
-> 2: (if clean install): writes `/var/lib/printellect/config.json`.
-> 3: acquires `/run/printellect-migration.lock`, writes `/var/lib/printellect/backups/`, writes `/etc/printellect/migration.json`, arms `printellect-migration-recover.service`, stops and disables legacy unit, installs `/etc/systemd/system/printellect.service` and `/etc/systemd/system/printellect.service.d/10-runtime.conf` pointing to staged Node 24, enables and starts `printellect.service`, verifies health gate, and disarms recovery unit upon completion.
+> 2: (if clean install): `[CONFIGURATION MUTATION]` writes `/var/lib/printellect/config.json` with permissions `0640` owned by `printellect:printellect`.
+> 3: `[SERVICE MUTATION]` acquires `/run/printellect-migration.lock`, writes `/var/lib/printellect/backups/`, writes `/etc/printellect/migration.json`, arms `printellect-migration-recover.service`, stops and disables legacy unit, installs `/etc/systemd/system/printellect.service` and `/etc/systemd/system/printellect.service.d/10-runtime.conf` pointing to staged Node 24, enables and starts `printellect.service`, verifies health gate, and disarms recovery unit upon completion.
 
 ```bash
 # 1. [READ-ONLY] Read-only service preflight and dry-run
 sudo bash /opt/printellect/current/scripts/install-service.sh --preflight-only --migrate-legacy auto
 sudo bash /opt/printellect/current/scripts/install-service.sh --dry-run --migrate-legacy auto --enable --start
 
-# 2. [MUTATES SYSTEM STATE] (Clean Install Only) Configure CUPS printers non-interactively if no config.json exists
-#    (Automatically invokes staged Node.js 24 via bin/printellect-setup wrapper)
+# 2. [CONFIGURATION MUTATION] (Clean Install Only) Configure CUPS printers non-interactively if no config.json exists
+#    (Automatically invokes staged Node.js 24 via bin/printellect-setup wrapper; saves config.json with 0640 permissions for printellect user)
 sudo printellect-setup --bw Canon_GX6100 --color Canon_GX6100
 
-# 3. [MUTATES SYSTEM STATE] Execute migration cutover
+# 3. [SERVICE MUTATION] Execute migration cutover
 #    (Automatically detects /opt/printellect/runtime/current/bin/node and generates 10-runtime.conf)
 sudo bash /opt/printellect/current/scripts/install-service.sh --migrate-legacy auto --enable --start
 
@@ -215,17 +215,17 @@ ps -eo user,pid,cmd | grep '[n]ode'         # Must show ONLY user 'printellect' 
 ---
 
 ### Phase VI — End-to-End Physical CUPS Printing Acceptance Gate (Mandatory Before Final Sign-Off)
-> **State Impact**: `[MUTATES PRINTER]` (2 & 3: prints test sheets on physical hardware).
+> **State Impact**: `[HARDWARE/PRINT MUTATION]` (2 & 3: prints test sheets on physical hardware).
 
 ```bash
 # 1. [READ-ONLY] Verify config.json readability and CUPS queue enabled/accepting state as unprivileged 'printellect' user
 sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js --check-queues
 
-# 2. [MUTATES PRINTER] Submit controlled 1-page B&W grayscale single-sided acceptance print (if bwPrinter configured)
+# 2. [HARDWARE/PRINT MUTATION] Submit controlled 1-page B&W grayscale single-sided acceptance print (if bwPrinter configured)
 sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
   --submit-test-job --role bw --color false --duplex false --copies 1 --generate-test-pdf --wait-completion-sec 45
 
-# 3. [MUTATES PRINTER] Submit controlled Color RGB duplex acceptance print (if colorPrinter configured and supports duplex; else --duplex false)
+# 3. [HARDWARE/PRINT MUTATION] Submit controlled Color RGB duplex acceptance print (if colorPrinter configured and supports duplex; else --duplex false)
 sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
   --submit-test-job --role color --color true --duplex true --copies 1 --generate-test-pdf --wait-completion-sec 60
 ```

@@ -11,6 +11,11 @@ import {
   selectTargetPrinter,
   processJob,
   startDaemon,
+  resolveLedgerDir,
+  acquireJobClaim,
+  getJobRecord,
+  writeJobRecord,
+  acquireDaemonLock,
 } from '../index.js';
 import * as printer from '../printer.js';
 
@@ -157,9 +162,11 @@ describe('Phase 5 — Firestore Job Lifecycle, Payment Gate, Shared Queue & Expl
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'printellect-daemon-jobs-'));
+    process.env.PRINTELLECT_JOBS_DIR = path.join(tempDir, 'jobs');
   });
 
   afterEach(() => {
+    delete process.env.PRINTELLECT_JOBS_DIR;
     if (tempDir && fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -388,6 +395,8 @@ describe('Phase 5 — Firestore Job Lifecycle, Payment Gate, Shared Queue & Expl
       argv: [],
       env: { KIOSK_SESSION_ID: 'kiosk_target_01' },
       registerSignals: false,
+      runDir: tempDir,
+      tempDir,
       state,
       exit: (code) => exitCodes.push(code),
       loadConfig: () => ({
@@ -825,6 +834,400 @@ describe('Phase 5 — Firestore Job Lifecycle, Payment Gate, Shared Queue & Expl
     assert.equal(staleReplay.outcome, 'duplicate_ignored');
     assert.equal(printCount, 1);
     assert.equal(committedUpdates.length, 1);
+  });
+});
+
+describe('Phase 5.2 — Durable Print-Job Idempotency, Concurrency & Crash Recovery Matrix', () => {
+  let tempDir;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'printellect-durable-jobs-'));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  });
+
+  it('1. should never reprocess or print a job already marked "failed" after daemon restart', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // Pre-record job in durable ledger as 'failed' (from prior run)
+    writeJobRecord(ledgerDir, 'job_prev_failed', {
+      jobId: 'job_prev_failed',
+      status: 'failed',
+      error: 'Simulated prior failure',
+      printedFiles: [],
+      totalFiles: 1,
+    });
+
+    // Fresh daemon state simulating post-restart
+    const freshState = createFreshState();
+    let printCalls = 0;
+
+    const res = await processJob(
+      'job_prev_failed',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: freshState,
+        printer: { print: async () => { printCalls++; } },
+      }
+    );
+
+    assert.equal(res.outcome, 'duplicate_ignored');
+    assert.equal(printCalls, 0, 'Must NEVER print a job that previously failed');
+    assert.equal(freshState.failedJobs.has('job_prev_failed'), true);
+
+    // Also verify defensive Firestore check: if snapshot has status='failed'
+    const res2 = await processJob(
+      'job_firestore_failed',
+      { status: 'failed', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: freshState,
+        printer: { print: async () => { printCalls++; } },
+      }
+    );
+    assert.equal(res2.outcome, 'duplicate_ignored');
+    assert.equal(printCalls, 0);
+  });
+
+  it('2. should never reprocess or print a job already marked "completed" or "delivered" after daemon restart', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // Pre-record job in durable ledger as 'completed'
+    writeJobRecord(ledgerDir, 'job_prev_completed', {
+      jobId: 'job_prev_completed',
+      status: 'completed',
+      printedFiles: ['f1'],
+      totalFiles: 1,
+      collectionTrays: ['Tray 1'],
+    });
+
+    const freshState = createFreshState();
+    let printCalls = 0;
+
+    const res = await processJob(
+      'job_prev_completed',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: freshState,
+        printer: { print: async () => { printCalls++; } },
+      }
+    );
+
+    assert.equal(res.outcome, 'duplicate_ignored');
+    assert.equal(printCalls, 0, 'Must NEVER re-print a completed job on restart');
+    assert.equal(freshState.completedJobs.has('job_prev_completed'), true);
+
+    // Test Firestore status='delivered'
+    const resDelivered = await processJob(
+      'job_delivered_doc',
+      { status: 'delivered', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: freshState,
+        printer: { print: async () => { printCalls++; } },
+      }
+    );
+    assert.equal(resDelivered.outcome, 'duplicate_ignored');
+    assert.equal(printCalls, 0);
+  });
+
+  it('3. should recover cleanly when crash occurs after CUPS accepts job but before Firestore records success (zero duplicate print)', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // Process 1: CUPS spooled job, wrote 'printed' to ledger, then process terminated before updateDoc completed
+    writeJobRecord(ledgerDir, 'job_crash_after_cups', {
+      jobId: 'job_crash_after_cups',
+      status: 'printed',
+      printedFiles: ['f1'],
+      totalFiles: 1,
+      collectionTrays: ['Tray 1'],
+    });
+
+    // Process 2: Daemon restarts with clean in-memory state
+    const postRestartState = createFreshState();
+    let postRestartPrintCalls = 0;
+    const committedFirestoreUpdates = [];
+
+    const res = await processJob(
+      'job_crash_after_cups',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: postRestartState,
+        printer: {
+          print: async () => {
+            postRestartPrintCalls++;
+          },
+        },
+        doc: (_db, col, id) => ({ col, id }),
+        updateDoc: async (_ref, data) => {
+          committedFirestoreUpdates.push(data);
+        },
+      }
+    );
+
+    assert.equal(res.outcome, 'recovered_completed');
+    assert.equal(postRestartPrintCalls, 0, 'CRITICAL: Must NEVER re-send print job to CUPS when already printed before crash');
+    assert.equal(committedFirestoreUpdates.length, 1);
+    assert.equal(committedFirestoreUpdates[0].status, 'completed');
+    assert.deepEqual(committedFirestoreUpdates[0]['collection-trays'], ['Tray 1']);
+
+    // Check ledger was updated to 'completed'
+    const record = getJobRecord(ledgerDir, 'job_crash_after_cups');
+    assert.equal(record.status, 'completed');
+  });
+
+  it('4. should handle failed final Firestore status update and recover without duplicate physical printing', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    let printCalls = 0;
+    const filesSnap = {
+      empty: false,
+      docs: [{ id: 'f1', data: () => ({ 'file-url': 'https://example.com/doc.pdf', 'file-name': 'doc.pdf', color: false }) }],
+    };
+
+    // Run 1: CUPS succeeds, but Firestore status write fails after all retries
+    const state1 = createFreshState();
+    const failRes = await processJob(
+      'job_firestore_fail_after_print',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: state1,
+        statusMaxAttempts: 1,
+        statusRetryDelayMs: 0,
+        collection: () => ({}),
+        getDocs: async () => filesSnap,
+        fetch: makeFakeFetch({ '*': { ok: true } }),
+        printer: { print: async () => { printCalls++; } },
+        doc: (_db, col, id) => ({ col, id }),
+        updateDoc: async () => {
+          throw new Error('UNAVAILABLE: Firestore connection failed completely');
+        },
+      }
+    );
+    assert.equal(failRes.outcome, 'error');
+    assert.equal(printCalls, 1);
+
+    // Ledger must be 'printed' because CUPS succeeded
+    const record = getJobRecord(ledgerDir, 'job_firestore_fail_after_print');
+    assert.equal(record.status, 'printed');
+
+    // Run 2: Daemon restarts and network is restored
+    const state2 = createFreshState();
+    const updates2 = [];
+    const recoveredRes = await processJob(
+      'job_firestore_fail_after_print',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: state2,
+        printer: { print: async () => { printCalls++; } },
+        doc: (_db, col, id) => ({ col, id }),
+        updateDoc: async (_ref, data) => { updates2.push(data); },
+      }
+    );
+
+    assert.equal(recoveredRes.outcome, 'recovered_completed');
+    assert.equal(printCalls, 1, 'CUPS must NOT be called a second time');
+    assert.equal(updates2.length, 1);
+    assert.equal(updates2[0].status, 'completed');
+  });
+
+  it('5. should fail closed and never re-print printed files when a partial multi-file job fails', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    let printCalls = 0;
+    const printedFiles = [];
+    const filesSnap = {
+      empty: false,
+      docs: [
+        { id: 'f1', data: () => ({ 'file-url': 'https://example.com/f1.pdf', 'file-name': 'f1.pdf', color: false }) },
+        { id: 'f2', data: () => ({ 'file-url': 'https://example.com/f2.pdf', 'file-name': 'f2.pdf', color: false }) },
+      ],
+    };
+
+    const state1 = createFreshState();
+    const failRes = await processJob(
+      'job_partial_multi_fail',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: state1,
+        collection: () => ({}),
+        getDocs: async () => filesSnap,
+        fetch: makeFakeFetch({ '*': { ok: true } }),
+        printer: {
+          print: async (filePath) => {
+            printCalls++;
+            if (filePath.includes('f2')) {
+              throw new Error('CUPS paper jam on f2');
+            }
+            printedFiles.push(filePath);
+          },
+        },
+        doc: (_db, col, id) => ({ col, id }),
+        updateDoc: async () => {},
+      }
+    );
+
+    assert.equal(failRes.outcome, 'failed');
+    assert.equal(printedFiles.length, 1, 'Only f1 succeeded before f2 jammed');
+    assert.equal(printCalls, 2, 'Attempted f1 and f2 exactly once');
+
+    // Ledger must be 'failed'
+    const record = getJobRecord(ledgerDir, 'job_partial_multi_fail');
+    assert.equal(record.status, 'failed');
+    assert.deepEqual(record.printedFiles, ['f1']);
+
+    // Replay on restart: must be rejected without re-printing f1 or re-attempting
+    const state2 = createFreshState();
+    const replayRes = await processJob(
+      'job_partial_multi_fail',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: state2,
+        printer: { print: async () => { printCalls++; } },
+      }
+    );
+    assert.equal(replayRes.outcome, 'duplicate_ignored');
+    assert.equal(printCalls, 2, 'f1 must NEVER be printed again');
+  });
+
+  it('6. should fail closed with ambiguous_crash when daemon crashed during active print execution', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // Pre-record state as 'printing' (interrupted mid-print)
+    writeJobRecord(ledgerDir, 'job_crashed_mid_print', {
+      jobId: 'job_crashed_mid_print',
+      status: 'printing',
+      currentFile: 'f1',
+      printedFiles: [],
+      totalFiles: 1,
+    });
+
+    const state = createFreshState();
+    let printCalls = 0;
+    const committedUpdates = [];
+
+    const res = await processJob(
+      'job_crashed_mid_print',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state,
+        printer: { print: async () => { printCalls++; } },
+        doc: (_db, col, id) => ({ col, id }),
+        updateDoc: async (_ref, data) => { committedUpdates.push(data); },
+      }
+    );
+
+    assert.equal(res.outcome, 'failed');
+    assert.equal(res.reason, 'ambiguous_crash');
+    assert.equal(printCalls, 0, 'Cannot blindly retry printing when previous state was ambiguous');
+    assert.equal(committedUpdates.length, 1);
+    assert.equal(committedUpdates[0].status, 'failed');
+    assert.match(committedUpdates[0]['failure-reason'], /Ambiguous print outcome/);
+
+    const record = getJobRecord(ledgerDir, 'job_crashed_mid_print');
+    assert.equal(record.status, 'ambiguous_crash');
+  });
+
+  it('7. should prevent two daemon instances from processing the same job concurrently', async () => {
+    const ledgerDir = path.join(tempDir, 'jobs');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // Instance 1 acquires claim on job_concurrent
+    const claim1 = acquireJobClaim(ledgerDir, 'job_concurrent');
+    assert.equal(claim1.acquired, true);
+
+    // Instance 2 attempts to claim same job concurrently
+    const claim2 = acquireJobClaim(ledgerDir, 'job_concurrent');
+    assert.equal(claim2.acquired, false);
+    assert.equal(claim2.reason, 'locked_by_concurrent_instance');
+
+    let printCalls = 0;
+    const res = await processJob(
+      'job_concurrent',
+      { status: 'on-queue', shopid: 'shop_1', 'is-kiosk-job': true },
+      { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' },
+      {
+        tempDir,
+        ledgerDir,
+        state: createFreshState(),
+        printer: { print: async () => { printCalls++; } },
+      }
+    );
+
+    assert.equal(res.outcome, 'concurrent_claim_rejected');
+    assert.equal(printCalls, 0);
+
+    claim1.release();
+
+    // After release, claim can be acquired
+    const claim3 = acquireJobClaim(ledgerDir, 'job_concurrent');
+    assert.equal(claim3.acquired, true);
+    claim3.release();
+  });
+
+  it('8. should enforce single active daemon instance on the kiosk host via acquireDaemonLock', () => {
+    const runDir = path.join(tempDir, 'run');
+    fs.mkdirSync(runDir, { recursive: true });
+
+    // Instance 1 acquires daemon lock
+    const lock1 = acquireDaemonLock(runDir);
+    assert.equal(lock1.acquired, true);
+    assert.equal(fs.existsSync(lock1.lockFile), true);
+
+    // Instance 2 attempts to start -> throws fatal lock error
+    assert.throws(
+      () => acquireDaemonLock(runDir),
+      /Another PRINTELLECT daemon instance is already active/
+    );
+
+    // Instance 1 shuts down cleanly
+    lock1.release();
+    assert.equal(fs.existsSync(lock1.lockFile), false);
+
+    // Now Instance 2 can start cleanly
+    const lock2 = acquireDaemonLock(runDir);
+    assert.equal(lock2.acquired, true);
+    lock2.release();
   });
 });
 

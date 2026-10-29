@@ -8,6 +8,8 @@ import {
   saveConfig,
   loadConfig,
   migrateLegacyConfig,
+  ensureSecureConfigPermissions,
+  resolveServiceIdentity,
   ConfigError,
   ConfigConflictError,
 } from '../config.js';
@@ -299,5 +301,60 @@ describe('Config Module - Safe Legacy Migration', () => {
     // Verify source was NOT altered
     const legacyAfter = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
     assert.deepEqual(legacyAfter, legacyData);
+  });
+});
+
+describe('Phase 5.2 — Configuration Access Permissions & Least-Privilege Model', () => {
+  let tempDir;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'printellect-perm-test-'));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  });
+
+  it('should enforce 0640 file mode and 0750 directory mode when saving configuration', () => {
+    const targetPath = path.join(tempDir, 'var_lib', 'config.json');
+    const validConfig = { bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' };
+
+    saveConfig(validConfig, targetPath);
+    assert.equal(fs.existsSync(targetPath), true);
+
+    if (process.platform !== 'win32') {
+      const fileStat = fs.statSync(targetPath);
+      const dirStat = fs.statSync(path.dirname(targetPath));
+
+      const filePerms = fileStat.mode & 0o777;
+      const dirPerms = dirStat.mode & 0o777;
+
+      assert.equal(filePerms, 0o640, `config.json mode must be 0640 (got 0${filePerms.toString(8)})`);
+      assert.equal(dirPerms, 0o750, `directory mode must be 0750 (got 0${dirPerms.toString(8)})`);
+
+      // Invariants: Never world-readable (0o004) and never world-writable (0o002)
+      assert.equal((filePerms & 0o004), 0, 'Must NOT be world-readable');
+      assert.equal((filePerms & 0o002), 0, 'Must NOT be world-writable');
+      assert.equal((dirPerms & 0o007), 0, 'Parent directory must have zero access for others');
+    }
+  });
+
+  it('should support ensureSecureConfigPermissions utility with mock identity', () => {
+    const targetFile = path.join(tempDir, 'test-cfg.json');
+    fs.writeFileSync(targetFile, JSON.stringify({ bwPrinter: 'Canon_GX6100', colorPrinter: null }));
+
+    const ok = ensureSecureConfigPermissions(targetFile, {
+      mode: 0o640,
+      identity: { uid: 999, gid: 999, user: 'printellect', group: 'printellect' },
+    });
+    assert.equal(ok, true);
+
+    // Non-existent path returns false
+    const missing = ensureSecureConfigPermissions(path.join(tempDir, 'missing.json'));
+    assert.equal(missing, false);
   });
 });

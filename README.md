@@ -113,11 +113,14 @@ sha256sum -c SHA256SUMS
 openssl pkeyutl -verify -pubin -inkey release-key.pub.pem \
   -rawin -in manifest.json -sigfile manifest.json.sig
 
-# 1c. [READ-ONLY] Dry-run bootstrap verification
-#     (Verifies prerequisites, disk space, and release integrity against pinned public key; session ID is masked in logs)
+# 1c. [READ-ONLY] Inspect existing Kiosk Session ID (if already configured)
+cat /etc/printellect/kiosk.env 2>/dev/null || systemctl show -p Environment printellect-kiosk.service 2>/dev/null || true
+
+# 1d. [READ-ONLY] Dry-run bootstrap verification
+#     (Verifies prerequisites, disk space, and release integrity against pinned public key; session ID is auto-discovered or can be passed via --session-id)
 sudo bash ./bootstrap.sh \
-  --session-id "<KIOSK_SESSION_ID>" \
-  --local-release-dir . \
+  --release-dir . \
+  --version 1.0.2 \
   --skip-printer-setup \
   --dry-run
 ```
@@ -146,12 +149,12 @@ sudo bash ./validate-legacy-node24.sh \
 ```
 
 ### Step 3 — Stage Signed Release into `/opt/printellect/releases/<ver>`
-> **State Impact**: `[MUTATES SYSTEM STATE]` — Creates `/opt/printellect/releases/<ver>`, runs `npm ci --omit=dev` using staged Node.js 24, updates `/opt/printellect/current` symlink, creates `/usr/local/bin/printellect-setup` symlink, and writes `/etc/printellect/kiosk.env` (`0640`). Live services remain untouched and legacy service continues running.
+> **State Impact**: `[FILESYSTEM MUTATION]` — Creates `/opt/printellect/releases/<ver>`, runs `npm ci --omit=dev` using staged Node.js 24, updates `/opt/printellect/current` symlink, creates `/usr/local/bin/printellect-setup` symlink, and writes `/etc/printellect/kiosk.env` (`0640`, `root:printellect`). Live services remain untouched and legacy service continues running.
 ```bash
-# 3a. [MUTATES SYSTEM STATE] Extract and stage release (verifies against pinned public key without --pubkey)
+# 3a. [FILESYSTEM MUTATION] Extract and stage release (verifies against pinned public key; auto-discovers session ID or accept --session-id)
 sudo bash ./bootstrap.sh \
-  --session-id "<KIOSK_SESSION_ID>" \
-  --local-release-dir . \
+  --release-dir . \
+  --version 1.0.2 \
   --skip-printer-setup
 
 # 3b. [READ-ONLY] Validate newly staged release modules and dependencies under staged Node.js 24
@@ -172,21 +175,21 @@ sudo bash /opt/printellect/current/scripts/stage-node-runtime.sh \
 > *(For administrators desiring an optional system-wide upgrade to retire EOL Node.js 20 globally, see Appendix A.)*
 
 ### Step 5 — Configure Printers & Execute `systemd` Service Cutover
-> **State Impact**: `[MUTATES SYSTEM STATE]` — 
+> **State Impact**:
 > 5a: `[READ-ONLY]` preflight and dry-run.
-> 5b (if clean install): writes `/var/lib/printellect/config.json`.
-> 5c: acquires `/run/printellect-migration.lock`, writes `/var/lib/printellect/backups/`, writes `/etc/printellect/migration.json`, arms `printellect-migration-recover.service`, stops and disables legacy unit, installs `/etc/systemd/system/printellect.service` and `/etc/systemd/system/printellect.service.d/10-runtime.conf` pointing to staged Node 24, enables and starts `printellect.service`, verifies health gate, and disarms recovery unit.
+> 5b (if clean install): `[CONFIGURATION MUTATION]` writes `/var/lib/printellect/config.json` with permissions `0640` owned by `printellect:printellect`.
+> 5c: `[SERVICE MUTATION]` acquires `/run/printellect-migration.lock`, writes `/var/lib/printellect/backups/`, writes `/etc/printellect/migration.json`, arms `printellect-migration-recover.service`, stops and disables legacy unit, installs `/etc/systemd/system/printellect.service` and `/etc/systemd/system/printellect.service.d/10-runtime.conf` pointing to staged Node 24, enables and starts `printellect.service`, verifies health gate, and disarms recovery unit.
 
 ```bash
 # 5a. [READ-ONLY] Run installer preflight and dry-run
 sudo bash /opt/printellect/current/scripts/install-service.sh --preflight-only --migrate-legacy auto
 sudo bash /opt/printellect/current/scripts/install-service.sh --dry-run --migrate-legacy auto --enable --start
 
-# 5b. [MUTATES SYSTEM STATE] (Clean Install Only) Configure CUPS printers non-interactively if no config.json exists
-#     (Runs on staged Node.js 24 via bin/printellect-setup launcher)
+# 5b. [CONFIGURATION MUTATION] (Clean Install Only) Configure CUPS printers non-interactively if no config.json exists
+#     (Runs on staged Node.js 24 via bin/printellect-setup; saves config.json with 0640 permissions for printellect user)
 sudo printellect-setup --bw Canon_GX6100 --color Canon_GX6100
 
-# 5c. [MUTATES SYSTEM STATE] Execute gated migration cutover
+# 5c. [SERVICE MUTATION] Execute gated migration cutover
 #     (Automatically detects /opt/printellect/runtime/current/bin/node and generates 10-runtime.conf)
 sudo bash /opt/printellect/current/scripts/install-service.sh --migrate-legacy auto --enable --start
 
@@ -206,11 +209,11 @@ Execute the CUPS acceptance gate **as the unprivileged `printellect` service use
 # 1. [READ-ONLY] Non-printing queue readiness gate (verifies config.json permissions, lpstat -p, and lpstat -a)
 sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js --check-queues
 
-# 2. [MUTATES PRINTER] Controlled 1-page B&W grayscale simplex acceptance print (zero fallback; tagged via lp -t)
+# 2. [HARDWARE/PRINT MUTATION] Controlled 1-page B&W grayscale simplex acceptance print (zero fallback; tagged via lp -t)
 sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
   --submit-test-job --role bw --color false --duplex false --copies 1 --generate-test-pdf --wait-completion-sec 45
 
-# 3. [MUTATES PRINTER] Controlled Color RGB duplex acceptance print (use --duplex false if queue is simplex-only)
+# 3. [HARDWARE/PRINT MUTATION] Controlled Color RGB duplex acceptance print (use --duplex false if queue is simplex-only)
 sudo -u printellect /opt/printellect/runtime/current/bin/node /opt/printellect/current/scripts/verify-print-acceptance.js \
   --submit-test-job --role color --color true --duplex true --copies 1 --generate-test-pdf --wait-completion-sec 60
 ```

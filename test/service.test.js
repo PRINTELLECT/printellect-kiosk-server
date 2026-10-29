@@ -271,6 +271,9 @@ WantedBy=multi-user.target
     assert.equal(fs.existsSync(destConfigFile), true);
     const destConfig = JSON.parse(fs.readFileSync(destConfigFile, 'utf8'));
     assert.deepEqual(destConfig, legacyConfig);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(destConfigFile).mode & 0o777, 0o640, 'Migrated config.json must have 0640 mode');
+    }
 
     // Verify legacy unit was backed up with timestamp
     const backupDir = path.join(tempRoot, 'var', 'lib', 'printellect', 'backups');

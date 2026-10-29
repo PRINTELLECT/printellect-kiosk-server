@@ -123,7 +123,7 @@ while [[ $# -gt 0 ]]; do
       ALLOW_INSECURE_HTTP=true
       shift
       ;;
-    --local-release-dir)
+    --release-dir|--local-release-dir)
       require_arg_value "$1" "$#" "${2:-}"
       LOCAL_RELEASE_DIR="$2"
       shift 2
@@ -174,10 +174,46 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Resolve installation paths (honoring --root-dir when provided)
+BASE_DIR="${ROOT_DIR}/opt/printellect"
+RELEASES_DIR="${BASE_DIR}/releases"
+CURRENT_LINK="${BASE_DIR}/current"
+CONFIG_DIR="${ROOT_DIR}/var/lib/printellect"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+BACKUP_DIR="${CONFIG_DIR}/backups"
+ENV_DIR="${ROOT_DIR}/etc/printellect"
+ENV_FILE="${ENV_DIR}/kiosk.env"
+CLI_SYMLINK="${ROOT_DIR}/usr/local/bin/printellect-setup"
+LOGICAL_CONFIG_FILE="/var/lib/printellect/config.json"
+[[ -n "${ROOT_DIR}" ]] && LOGICAL_CONFIG_FILE="${CONFIG_FILE}"
+
+# Resolve Kiosk Session ID safely (CLI -> env -> kiosk.env -> systemd units)
+if [[ -z "${SESSION_ID}" && -n "${KIOSK_SESSION_ID:-}" ]]; then
+  SESSION_ID="${KIOSK_SESSION_ID}"
+fi
+if [[ -z "${SESSION_ID}" && -f "${ENV_FILE}" ]]; then
+  SESSION_ID="$(grep -E '^[[:space:]]*KIOSK_SESSION_ID=' "${ENV_FILE}" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '"'\''[:space:]' || true)"
+fi
+if [[ -z "${SESSION_ID}" ]]; then
+  for ef in "${ROOT_DIR}/etc/systemd/system"/*.service "${ROOT_DIR}/etc/systemd/system"/*.service.d/*.conf; do
+    if [[ -f "${ef}" ]]; then
+      sid="$(grep -E '^[[:space:]]*(Environment=.*)?KIOSK_SESSION_ID=' "${ef}" 2>/dev/null | tail -n1 | sed -E 's/.*KIOSK_SESSION_ID=([^[:space:]"'\''\\]*).*/\1/' || true)"
+      if [[ -n "${sid}" ]]; then
+        SESSION_ID="${sid}"
+        break
+      fi
+    fi
+  done
+fi
+
+if [[ -z "${SESSION_ID}" && "${DRY_RUN}" == "true" ]]; then
+  SESSION_ID="dry-run-preflight-session"
+fi
+
 # Validate required arguments & strict SESSION_ID format (prevents env/heredoc injection)
 if [[ -z "${SESSION_ID}" ]]; then
   echo "[FATAL ERROR] Kiosk Session ID is required." >&2
-  echo "Specify it using --session-id <SESSION_ID>" >&2
+  echo "Specify it using --session-id <SESSION_ID> or ensure ${ENV_FILE} exists." >&2
   exit 1
 fi
 
@@ -186,7 +222,7 @@ if [[ ! "${SESSION_ID}" =~ ^[A-Za-z0-9_.:@-]{1,128}$ ]]; then
 fi
 
 if [[ -n "${LOCAL_RELEASE_DIR}" && -n "${RELEASE_URL}" ]]; then
-  fatal "Specify either --local-release-dir or --release-url, not both."
+  fatal "Specify either --local-release-dir (or --release-dir) or --release-url, not both."
 fi
 
 if [[ -n "${TARGET_VERSION}" ]]; then
@@ -207,19 +243,6 @@ mask_token() {
     echo "${token:0:3}****${token: -2} (length: ${len})"
   fi
 }
-
-# Resolve installation paths (honoring --root-dir when provided)
-BASE_DIR="${ROOT_DIR}/opt/printellect"
-RELEASES_DIR="${BASE_DIR}/releases"
-CURRENT_LINK="${BASE_DIR}/current"
-CONFIG_DIR="${ROOT_DIR}/var/lib/printellect"
-CONFIG_FILE="${CONFIG_DIR}/config.json"
-BACKUP_DIR="${CONFIG_DIR}/backups"
-ENV_DIR="${ROOT_DIR}/etc/printellect"
-ENV_FILE="${ENV_DIR}/kiosk.env"
-CLI_SYMLINK="${ROOT_DIR}/usr/local/bin/printellect-setup"
-LOGICAL_CONFIG_FILE="/var/lib/printellect/config.json"
-[[ -n "${ROOT_DIR}" ]] && LOGICAL_CONFIG_FILE="${CONFIG_FILE}"
 
 # Temporary & atomic swap state management (preserves previous working release if interrupted)
 TEMP_DIR=""
@@ -792,7 +815,7 @@ fi
 # 11. Create Directory Hierarchy (preserving any existing config.json and backups)
 log "Provisioning directory structure..."
 mkdir -p "${RELEASES_DIR}"
-mkdir -p "${CONFIG_DIR}" "${BACKUP_DIR}"
+mkdir -p "${CONFIG_DIR}" "${CONFIG_DIR}/jobs" "${BACKUP_DIR}"
 mkdir -p "${ENV_DIR}"
 mkdir -p "$(dirname "${CLI_SYMLINK}")"
 
@@ -806,8 +829,14 @@ fi
 if id -u printellect >/dev/null 2>&1; then
   chown printellect:printellect "${CONFIG_DIR}" >/dev/null 2>&1 || true
   chmod 0750 "${CONFIG_DIR}"
+  chmod 0750 "${CONFIG_DIR}/jobs" >/dev/null 2>&1 || true
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    chown printellect:printellect "${CONFIG_FILE}" >/dev/null 2>&1 || true
+    chmod 0640 "${CONFIG_FILE}" >/dev/null 2>&1 || true
+  fi
 else
-  chmod 0755 "${CONFIG_DIR}"
+  chmod 0750 "${CONFIG_DIR}"
+  chmod 0750 "${CONFIG_DIR}/jobs" >/dev/null 2>&1 || true
 fi
 chmod 0700 "${BACKUP_DIR}"
 

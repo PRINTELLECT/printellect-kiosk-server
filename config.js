@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { execFileSync } from 'child_process';
 
 /**
  * Standard paths for PRINTELLECT Kiosk Server configuration.
@@ -107,15 +108,68 @@ export function validateConfig(config) {
 }
 
 /**
+ * Resolves the numeric UID and GID for the service account ('printellect') on POSIX systems.
+ * Returns null on Windows or if the service user does not exist.
+ *
+ * @param {object} [options]
+ * @param {string} [options.user='printellect']
+ * @param {string} [options.group='printellect']
+ * @returns {{ uid: number, gid: number, user: string, group: string } | null}
+ */
+export function resolveServiceIdentity({ user = 'printellect', group = 'printellect' } = {}) {
+  if (process.platform === 'win32') return null;
+  try {
+    const userStr = execFileSync('id', ['-u', user], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }).trim();
+    const groupStr = execFileSync('id', ['-g', group], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }).trim();
+    const uid = Number(userStr);
+    const gid = Number(groupStr);
+    if (Number.isInteger(uid) && Number.isInteger(gid)) {
+      return { uid, gid, user, group };
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Enforces least-privilege POSIX permissions and ownership on configuration files.
+ * Default policy:
+ * - File mode: 0640 (rw-r-----): Owner read/write, Service group read, Others zero access.
+ * - Parent directory mode: 0750 (rwxr-x---).
+ * - Never world-readable or world-writable.
+ *
+ * @param {string} filePath
+ * @param {object} [options]
+ * @param {number} [options.mode=0o640]
+ * @param {object} [options.identity]
+ * @returns {boolean}
+ */
+export function ensureSecureConfigPermissions(filePath, { mode = 0o640, identity = null } = {}) {
+  if (!fs.existsSync(filePath)) return false;
+  try {
+    if (process.platform !== 'win32') {
+      fs.chmodSync(filePath, mode);
+      const targetIdentity = identity || resolveServiceIdentity();
+      if (targetIdentity && process.getuid && process.getuid() === 0) {
+        fs.chownSync(filePath, targetIdentity.uid, targetIdentity.gid);
+      }
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Atomically writes a valid configuration to disk with secure permissions.
  * Writes to a temporary file in the same directory, syncs to physical storage,
- * and atomically renames to the destination.
+ * enforces mode 0640 and service ownership, and atomically renames to destination.
  * 
  * @param {object} config - Configuration object to save.
  * @param {string} [targetPath] - Destination file path.
+ * @param {object} [options] - Optional permission / identity overrides.
  * @returns {string} The resolved destination path.
  */
-export function saveConfig(config, targetPath = null) {
+export function saveConfig(config, targetPath = null, options = {}) {
   const resolvedPath = getConfigPath(targetPath);
   const validation = validateConfig(config);
 
@@ -126,9 +180,21 @@ export function saveConfig(config, targetPath = null) {
     );
   }
 
+  const fileMode = options.mode ?? 0o640;
+  const dirMode = options.dirMode ?? 0o750;
+  const identity = options.identity || resolveServiceIdentity();
+
   const dir = path.dirname(resolvedPath);
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    fs.mkdirSync(dir, { recursive: true, mode: dirMode });
+    if (process.platform !== 'win32') {
+      try {
+        fs.chmodSync(dir, dirMode);
+        if (identity && process.getuid && process.getuid() === 0) {
+          fs.chownSync(dir, identity.uid, identity.gid);
+        }
+      } catch (_) {}
+    }
   }
 
   const tempFile = path.join(
@@ -139,12 +205,31 @@ export function saveConfig(config, targetPath = null) {
   const payload = JSON.stringify(validation.config, null, 2) + '\n';
 
   try {
-    const fd = fs.openSync(tempFile, 'w', 0o644);
+    const fd = fs.openSync(tempFile, 'w', fileMode);
     fs.writeSync(fd, payload, 0, 'utf8');
     fs.fsyncSync(fd);
-    fs.closeSync(fd);
 
+    if (process.platform !== 'win32') {
+      try {
+        fs.fchmodSync(fd, fileMode);
+        if (identity && process.getuid && process.getuid() === 0) {
+          fs.fchownSync(fd, identity.uid, identity.gid);
+        }
+      } catch (_) {}
+    }
+
+    fs.closeSync(fd);
     fs.renameSync(tempFile, resolvedPath);
+
+    if (process.platform !== 'win32') {
+      try {
+        fs.chmodSync(resolvedPath, fileMode);
+        if (identity && process.getuid && process.getuid() === 0) {
+          fs.chownSync(resolvedPath, identity.uid, identity.gid);
+        }
+      } catch (_) {}
+    }
+
     return resolvedPath;
   } catch (err) {
     if (fs.existsSync(tempFile)) {

@@ -758,4 +758,44 @@ describe('Bootstrap Installer — Dry Run, Cryptographic Authentication, Adversa
     assert.equal(fs.readFileSync(path.join(bakDir, 'legacy.service.bak'), 'utf8'), sentinelBak);
     assert.equal(fs.existsSync(path.join(prodRoot, 'opt', 'printellect', 'current', 'index.js')), true);
   });
+
+  it('should accept --release-dir alias, allow dry-run without --session-id, and auto-discover session ID from kiosk.env', () => {
+    const installRoot = path.join(tempDir, 'reconcile_root');
+    const envDir = path.join(installRoot, 'etc', 'printellect');
+    fs.mkdirSync(envDir, { recursive: true });
+    fs.writeFileSync(path.join(envDir, 'kiosk.env'), 'KIOSK_SESSION_ID="auto_discovered_session_42"\n');
+
+    const relRoot = toPosixRel(installRoot);
+
+    // 1. --release-dir alias + --version + --dry-run with NO --session-id MUST succeed
+    const dryRun = runBootstrap([
+      '--release-dir', relDistDir,
+      '--version', '1.0.0',
+      '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
+      '--root-dir', relRoot,
+      '--dry-run',
+      '--allow-unsupported-arch',
+    ]);
+    assert.equal(dryRun.status, 0, `Dry-run failed: ${dryRun.stderr}`);
+    assert.match(dryRun.stdout, /DRY RUN VALIDATION SUCCEEDED/);
+
+    // 2. Non-dry-run omitting --session-id MUST discover it from kiosk.env and succeed
+    const liveRun = runBootstrap([
+      '--release-dir', relDistDir,
+      '--version', '1.0.0',
+      '--pubkey', relPubkeyPath,
+      '--allow-untrusted-pubkey',
+      '--root-dir', relRoot,
+      '--skip-npm-ci',
+      '--skip-printer-setup',
+      '--allow-unsupported-arch',
+    ]);
+    assert.equal(liveRun.status, 0, `Live run with auto-discovered session failed: ${liveRun.stderr}`);
+    assert.match(liveRun.stdout, /PRINTELLECT KIOSK BOOTSTRAP INSTALLATION COMPLETE/);
+
+    // Verify kiosk.env preserved the auto-discovered session ID
+    const writtenEnv = fs.readFileSync(path.join(envDir, 'kiosk.env'), 'utf8');
+    assert.match(writtenEnv, /KIOSK_SESSION_ID="auto_discovered_session_42"/);
+  });
 });

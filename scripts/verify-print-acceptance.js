@@ -484,7 +484,7 @@ async function cliMain() {
       opts.configPath = args[++i];
     } else if (a === '--role' && args[i + 1]) {
       opts.role = args[++i];
-    } else if (a === '--printer' && args[i + 1]) {
+    } else if ((a === '--printer' || a === '--queue') && args[i + 1]) {
       opts.printer = args[++i];
     } else if (a === '--color' && args[i + 1]) {
       opts.color = parseBoolArg(args[++i], '--color');

@@ -597,6 +597,8 @@ class LpShim {
       env: {
         ...envNoSid,
         PRINTELLECT_CONFIG_PATH: path.join(suiteDir, 'nonexistent-config.json'),
+        PRINTELLECT_RUN_DIR: suiteDir,
+        PRINTELLECT_JOBS_DIR: path.join(suiteDir, 'jobs'),
       },
     });
     assert.equal(badCfgRes.status, 1);
@@ -732,6 +734,8 @@ process.stdin.on('data', (buf) => {
             DAEMON_NODE_EXE: process.execPath,
             DAEMON_LP_JS: path.join(suiteDir, 'lp-record.mjs'),
             DAEMON_LP_LOG: lpLogPath,
+            PRINTELLECT_RUN_DIR: suiteDir,
+            PRINTELLECT_JOBS_DIR: path.join(suiteDir, 'jobs'),
           },
         }
       );

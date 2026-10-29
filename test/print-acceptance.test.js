@@ -632,4 +632,41 @@ class CupsShim {
     assert.match(cliRes.stdout, /Spool Status\s+:\s+cups_spool_completed/);
     assert.match(cliRes.stdout, /\[PHYSICAL VERIFICATION REQUIRED\]/);
   });
+
+  it('should accept --queue alias and support --check-queues mode cleanly', () => {
+    const cfgPath = writeConfig({ bwPrinter: 'Canon_GX6100', colorPrinter: 'Canon_GX6100' });
+    writeCupsState({
+      queues: [{ name: 'Canon_GX6100', status: 'idle', accepting: true }],
+      completeOnPoll: 1,
+    });
+
+    // 1. --check-queues mode
+    const checkRes = spawnSync(
+      process.execPath,
+      [ACCEPTANCE_SCRIPT, '--check-queues', '--config', cfgPath, '--allow-non-service-user'],
+      { cwd: ROOT_DIR, encoding: 'utf8', env: process.env }
+    );
+    assert.equal(checkRes.status, 0, `Check-queues failed: ${checkRes.stderr}`);
+    assert.match(checkRes.stdout, /Result\s+:\s+QUEUE_PREFLIGHT_ONLY/);
+    assert.match(checkRes.stdout, /Queue visibility & accepting state verified/);
+
+    // 2. --submit-test-job using --queue alias
+    const queueRes = spawnSync(
+      process.execPath,
+      [
+        ACCEPTANCE_SCRIPT,
+        '--submit-test-job',
+        '--config', cfgPath,
+        '--role', 'bw',
+        '--queue', 'Canon_GX6100',
+        '--copies', '1',
+        '--generate-test-pdf',
+        '--wait-completion-sec', '3',
+        '--allow-non-service-user',
+      ],
+      { cwd: ROOT_DIR, encoding: 'utf8', env: process.env }
+    );
+    assert.equal(queueRes.status, 0, `Queue alias failed: ${queueRes.stderr}`);
+    assert.match(queueRes.stdout, /CUPS Job ID\s+:\s+Canon_GX6100-101/);
+  });
 });

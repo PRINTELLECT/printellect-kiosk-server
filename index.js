@@ -20,6 +20,161 @@ import { loadConfig as defaultLoadConfig } from './config.js';
 const MAX_COMPLETED_JOBS_CACHE = 1000;
 const DOWNLOAD_TIMEOUT_MS = 60000;
 
+export const DEFAULT_PRODUCTION_JOBS_DIR = process.platform === 'win32'
+  ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'printellect', 'jobs')
+  : '/var/lib/printellect/jobs';
+
+export function resolveLedgerDir(customDir = null) {
+  if (customDir) return path.resolve(customDir);
+  if (process.env.PRINTELLECT_JOBS_DIR) return path.resolve(process.env.PRINTELLECT_JOBS_DIR);
+  return DEFAULT_PRODUCTION_JOBS_DIR;
+}
+
+function getSafeJobFilename(jobId) {
+  return String(jobId || 'job').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'job';
+}
+
+export function acquireJobClaim(ledgerDir, jobId, { pid = process.pid, maxStaleMs = 300000 } = {}) {
+  if (!fs.existsSync(ledgerDir)) {
+    try { fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o750 }); } catch (_) {}
+  }
+  const safeName = getSafeJobFilename(jobId);
+  const lockPath = path.join(ledgerDir, `${safeName}.lock`);
+  let fd = null;
+  try {
+    fd = fs.openSync(lockPath, 'wx');
+    const claimData = JSON.stringify({ pid, createdAt: Date.now(), jobId }) + '\n';
+    fs.writeSync(fd, claimData, 0, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    return {
+      acquired: true,
+      lockPath,
+      release: () => {
+        try {
+          if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+        } catch (_) {}
+      },
+    };
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+    if (err.code === 'EEXIST') {
+      try {
+        const raw = fs.readFileSync(lockPath, 'utf8');
+        const lockObj = JSON.parse(raw);
+        const age = Date.now() - (lockObj.createdAt || 0);
+        let isStale = age > maxStaleMs;
+        if (!isStale && lockObj.pid) {
+          try {
+            process.kill(lockObj.pid, 0);
+          } catch (e) {
+            if (e.code === 'ESRCH') isStale = true;
+          }
+        }
+        if (isStale) {
+          try { fs.unlinkSync(lockPath); } catch (_) {}
+          return acquireJobClaim(ledgerDir, jobId, { pid, maxStaleMs });
+        }
+        return {
+          acquired: false,
+          reason: 'locked_by_concurrent_instance',
+          lockPid: lockObj.pid,
+        };
+      } catch (_) {
+        return { acquired: false, reason: 'locked_by_concurrent_instance' };
+      }
+    }
+    throw err;
+  }
+}
+
+export function getJobRecord(ledgerDir, jobId) {
+  const safeName = getSafeJobFilename(jobId);
+  const filePath = path.join(ledgerDir, `${safeName}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+export function writeJobRecord(ledgerDir, jobId, record) {
+  if (!fs.existsSync(ledgerDir)) {
+    try { fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o750 }); } catch (_) {}
+  }
+  const safeName = getSafeJobFilename(jobId);
+  const targetPath = path.join(ledgerDir, `${safeName}.json`);
+  const tempPath = path.join(ledgerDir, `.${safeName}.tmp.${process.pid}.${Date.now()}`);
+  const payload = JSON.stringify({ jobId, updatedAt: new Date().toISOString(), ...record }, null, 2) + '\n';
+  const fd = fs.openSync(tempPath, 'w', 0o640);
+  fs.writeSync(fd, payload, 0, 'utf8');
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+  fs.renameSync(tempPath, targetPath);
+  return targetPath;
+}
+
+export function acquireDaemonLock(runDir = null) {
+  const dir = runDir || process.env.PRINTELLECT_RUN_DIR || (process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'printellect')
+    : (fs.existsSync('/run') ? '/run' : '/var/lib/printellect'));
+  if (!fs.existsSync(dir)) {
+    try { fs.mkdirSync(dir, { recursive: true, mode: 0o755 }); } catch (_) {}
+  }
+  const lockFile = path.join(dir, 'printellect.lock');
+  let fd = null;
+  try {
+    fd = fs.openSync(lockFile, 'wx');
+    const content = JSON.stringify({ pid: process.pid, startedAt: Date.now() }) + '\n';
+    fs.writeSync(fd, content, 0, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    return {
+      acquired: true,
+      lockFile,
+      release: () => {
+        try { if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile); } catch (_) {}
+      },
+    };
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+    if (err.code === 'EEXIST') {
+      try {
+        const raw = fs.readFileSync(lockFile, 'utf8');
+        const lockObj = JSON.parse(raw);
+        let isStale = false;
+        if (lockObj.pid) {
+          try {
+            process.kill(lockObj.pid, 0);
+          } catch (e) {
+            if (e.code === 'ESRCH') isStale = true;
+          }
+        }
+        if (Date.now() - (lockObj.startedAt || 0) > 300000) {
+          isStale = true;
+        }
+        if (isStale) {
+          try { fs.unlinkSync(lockFile); } catch (_) {}
+          return acquireDaemonLock(runDir);
+        }
+        throw new Error(`Another PRINTELLECT daemon instance is already active (PID ${lockObj.pid}).`);
+      } catch (readErr) {
+        if (readErr.message && readErr.message.includes('Another PRINTELLECT daemon')) throw readErr;
+        try { fs.unlinkSync(lockFile); } catch (_) {}
+        return acquireDaemonLock(runDir);
+      }
+    }
+    throw err;
+  }
+}
+
 // Global load trackers and duplicate-execution guards
 const defaultState = {
   pendingBwPages: 0,
@@ -268,15 +423,110 @@ export async function processJob(jobId, jobData, config, deps = {}) {
   const tempDir = deps.tempDir || os.tmpdir();
   const state = deps.state || defaultState;
   const failedJobs = state.failedJobs || (state.failedJobs = new Set());
+  const ledgerDir = resolveLedgerDir(deps.ledgerDir || (deps.tempDir ? path.join(deps.tempDir, 'jobs') : null));
   const statusRetryOpts = {
     maxAttempts: deps.statusMaxAttempts ?? 3,
     retryDelayMs: deps.statusRetryDelayMs ?? 200,
   };
 
+  // 1. In-memory duplicate check
   if (state.completedJobs.has(jobId) || failedJobs.has(jobId)) {
     state.processingJobs.delete(jobId);
     return { outcome: 'duplicate_ignored', printedFiles: 0, totalFiles: 0 };
   }
+
+  // 2. Defensive Firestore status check (rejects already-terminal documents)
+  if (jobData && (jobData.status === 'completed' || jobData.status === 'delivered')) {
+    recordTrackedJob(state.completedJobs, jobId);
+    state.processingJobs.delete(jobId);
+    return { outcome: 'duplicate_ignored', printedFiles: 0, totalFiles: 0 };
+  }
+  if (jobData && jobData.status === 'failed') {
+    recordTrackedJob(failedJobs, jobId);
+    state.processingJobs.delete(jobId);
+    return { outcome: 'duplicate_ignored', printedFiles: 0, totalFiles: 0 };
+  }
+
+  // 3. Durable Ledger Check (survives daemon process restarts and crashes)
+  const existingRecord = getJobRecord(ledgerDir, jobId);
+  if (existingRecord) {
+    if (existingRecord.status === 'completed') {
+      recordTrackedJob(state.completedJobs, jobId);
+      state.processingJobs.delete(jobId);
+      return { outcome: 'duplicate_ignored', printedFiles: 0, totalFiles: 0 };
+    }
+    if (existingRecord.status === 'failed' || existingRecord.status === 'ambiguous_crash') {
+      recordTrackedJob(failedJobs, jobId);
+      state.processingJobs.delete(jobId);
+      return { outcome: 'duplicate_ignored', printedFiles: 0, totalFiles: 0 };
+    }
+    if (existingRecord.status === 'printed') {
+      // Succeeded in CUPS before crash/disconnect -> complete Firestore update without re-printing
+      console.log(`[DURABLE RECOVERY] Job ${jobId} was previously spooled to CUPS. Completing Firestore status without re-printing...`);
+      const taskDocRef = docFn(firestoreDb, 'tasks', jobId);
+      const collectionTrays = existingRecord.collectionTrays || ['Tray 1'];
+      await updateTaskStatusWithRetry(
+        updateDocFn,
+        taskDocRef,
+        {
+          status: 'completed',
+          'completed-time': new Date(),
+          'collection-trays': collectionTrays,
+        },
+        statusRetryOpts
+      );
+      writeJobRecord(ledgerDir, jobId, { ...existingRecord, status: 'completed' });
+      recordTrackedJob(state.completedJobs, jobId);
+      state.processingJobs.delete(jobId);
+      return {
+        outcome: 'recovered_completed',
+        printedFiles: existingRecord.printedFiles ? existingRecord.printedFiles.length : 1,
+        totalFiles: existingRecord.totalFiles || 1,
+        collectionTrays,
+      };
+    }
+    if (
+      existingRecord.status === 'claimed' ||
+      existingRecord.status === 'downloading' ||
+      existingRecord.status === 'printing'
+    ) {
+      // Process died during active print execution: outcome is ambiguous.
+      // Do not blindly retry CUPS; fail closed and record for technician review.
+      const crashReason = `Ambiguous print outcome: daemon process terminated during ${existingRecord.status}. Physical inspection required before retry.`;
+      console.error(`[CRASH RECOVERY FAIL-CLOSED] Job ${jobId}: ${crashReason}`);
+      writeJobRecord(ledgerDir, jobId, { ...existingRecord, status: 'ambiguous_crash', error: crashReason });
+      recordTrackedJob(failedJobs, jobId);
+      const taskDocRef = docFn(firestoreDb, 'tasks', jobId);
+      await updateTaskStatusWithRetry(
+        updateDocFn,
+        taskDocRef,
+        {
+          status: 'failed',
+          'failed-time': new Date(),
+          'failure-reason': crashReason,
+        },
+        statusRetryOpts
+      );
+      state.processingJobs.delete(jobId);
+      return {
+        outcome: 'failed',
+        reason: 'ambiguous_crash',
+        printedFiles: existingRecord.printedFiles ? existingRecord.printedFiles.length : 0,
+        totalFiles: existingRecord.totalFiles || 0,
+      };
+    }
+  }
+
+  // 4. Concurrency Guard: Atomic lock claim for this specific job
+  const claim = acquireJobClaim(ledgerDir, jobId);
+  if (!claim.acquired) {
+    console.warn(`[CONCURRENT GUARD] Job ${jobId} is currently being processed by another worker/instance (pid: ${claim.lockPid || 'active'}).`);
+    state.processingJobs.delete(jobId);
+    return { outcome: 'concurrent_claim_rejected', reason: 'locked' };
+  }
+
+  writeJobRecord(ledgerDir, jobId, { jobId, status: 'claimed', claimedAt: new Date().toISOString() });
+  const succeededFilesList = [];
 
   try {
     const taskDocRef = docFn(firestoreDb, 'tasks', jobId);
@@ -285,6 +535,13 @@ export async function processJob(jobId, jobData, config, deps = {}) {
 
     if (filesSnap.empty || !filesSnap.docs || filesSnap.docs.length === 0) {
       console.error(`[ERROR] No printable files found in tasks/${jobId}/files. Marking job failed.`);
+      writeJobRecord(ledgerDir, jobId, {
+        jobId,
+        status: 'failed',
+        error: 'No printable files found in task subcollection',
+        printedFiles: [],
+        totalFiles: 0,
+      });
       recordTrackedJob(failedJobs, jobId);
       await updateTaskStatusWithRetry(
         updateDocFn,
@@ -353,6 +610,14 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       }
 
       try {
+        writeJobRecord(ledgerDir, jobId, {
+          jobId,
+          status: 'downloading',
+          currentFile: fileDoc.id,
+          printedFiles: succeededFilesList,
+          totalFiles: filesSnap.docs.length,
+        });
+
         console.log(`Downloading ${displayFileName}...`);
         await downloadFile(downloadUrl, filePath, fetchImpl);
 
@@ -380,10 +645,26 @@ export async function processJob(jobId, jobData, config, deps = {}) {
           duplex: fileData['fb'] === true,
         };
 
+        writeJobRecord(ledgerDir, jobId, {
+          jobId,
+          status: 'printing',
+          currentFile: fileDoc.id,
+          printedFiles: succeededFilesList,
+          totalFiles: filesSnap.docs.length,
+        });
+
         try {
           await printerMod.print(filePath, printOptions);
           console.log(`✅ Successfully printed ${displayFileName} on ${targetPrinter}`);
           succeededFiles += 1;
+          succeededFilesList.push(fileDoc.id);
+          writeJobRecord(ledgerDir, jobId, {
+            jobId,
+            status: 'printing',
+            printedFiles: succeededFilesList,
+            totalFiles: filesSnap.docs.length,
+          });
+
           if (isSharedQueue) {
             printedOnBw = true;
           } else if (targetPrinter === config.colorPrinter) {
@@ -417,6 +698,13 @@ export async function processJob(jobId, jobData, config, deps = {}) {
                 `✅ Successfully printed ${displayFileName} on fallback printer (${config.colorPrinter})`
               );
               succeededFiles += 1;
+              succeededFilesList.push(fileDoc.id);
+              writeJobRecord(ledgerDir, jobId, {
+                jobId,
+                status: 'printing',
+                printedFiles: succeededFilesList,
+                totalFiles: filesSnap.docs.length,
+              });
               printedOnColor = true;
             } catch (fallbackErr) {
               const cleanFallbackErr = sanitizeLogMessage(fallbackErr);
@@ -460,6 +748,13 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       console.error(
         `[JOB FAILED] Job ${jobId} did not complete (${succeededFiles}/${filesSnap.docs.length} file(s) printed): ${reasonSummary}`
       );
+      writeJobRecord(ledgerDir, jobId, {
+        jobId,
+        status: 'failed',
+        error: reasonSummary,
+        printedFiles: succeededFilesList,
+        totalFiles: filesSnap.docs.length,
+      });
       recordTrackedJob(failedJobs, jobId);
       await updateTaskStatusWithRetry(
         updateDocFn,
@@ -482,9 +777,6 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       };
     }
 
-    // All files printed successfully -> record completed before Firestore ack to prevent duplicate re-print
-    recordTrackedJob(state.completedJobs, jobId);
-
     const collectionTrays = [];
     if (printedOnBw) collectionTrays.push('Tray 1');
     if (printedOnColor) collectionTrays.push('Tray 2');
@@ -494,6 +786,17 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       if (hasColorFile) collectionTrays.push('Tray 2');
       if (collectionTrays.length === 0) collectionTrays.push('Tray 1');
     }
+
+    // Record 'printed' in durable ledger BEFORE Firestore status write so a crash never causes duplicate prints
+    writeJobRecord(ledgerDir, jobId, {
+      jobId,
+      status: 'printed',
+      printedFiles: succeededFilesList,
+      totalFiles: filesSnap.docs.length,
+      collectionTrays,
+    });
+
+    recordTrackedJob(state.completedJobs, jobId);
 
     console.log(
       `\n🎉 [KIOSK OUTPUT] Job ${jobId} finished! Collection Tray(s): ${collectionTrays.join(' and ')}`
@@ -509,6 +812,16 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       },
       statusRetryOpts
     );
+
+    // Terminal completion confirmed
+    writeJobRecord(ledgerDir, jobId, {
+      jobId,
+      status: 'completed',
+      printedFiles: succeededFilesList,
+      totalFiles: filesSnap.docs.length,
+      collectionTrays,
+    });
+
     state.processingJobs.delete(jobId);
     console.log(`Updated job ${jobId} status to completed with collection-trays.`);
 
@@ -519,12 +832,28 @@ export async function processJob(jobId, jobData, config, deps = {}) {
       collectionTrays,
     };
   } catch (error) {
+    const existingRec = getJobRecord(ledgerDir, jobId);
+    if (existingRec && existingRec.status === 'printed') {
+      writeJobRecord(ledgerDir, jobId, {
+        ...existingRec,
+        lastError: sanitizeLogMessage(error),
+      });
+    } else {
+      writeJobRecord(ledgerDir, jobId, {
+        jobId,
+        status: 'failed',
+        error: sanitizeLogMessage(error),
+        printedFiles: succeededFilesList,
+      });
+    }
     state.processingJobs.delete(jobId);
     console.error(`[ERROR] Failed to process job ${jobId}: ${sanitizeLogMessage(error)}`);
     return {
       outcome: 'error',
       error: sanitizeLogMessage(error),
     };
+  } finally {
+    claim.release();
   }
 }
 
@@ -563,6 +892,18 @@ export async function startDaemon(deps = {}) {
     console.error('Provide it via environment variable KIOSK_SESSION_ID or argument:');
     console.error('  node index.js <SESSION_ID>\n');
     return exitFn(1);
+  }
+
+  // Ensure a single daemon instance is active on this host
+  let daemonLockRelease = null;
+  if (deps.acquireDaemonLock !== false) {
+    try {
+      const lockObj = acquireDaemonLock(deps.runDir);
+      daemonLockRelease = lockObj.release;
+    } catch (lockErr) {
+      console.error(`\n[FATAL LOCK ERROR] ${sanitizeLogMessage(lockErr)}`);
+      return exitFn(1);
+    }
   }
 
   // Load configuration non-interactively
@@ -653,6 +994,11 @@ export async function startDaemon(deps = {}) {
     try {
       unsubscribe();
     } catch (_) {}
+    if (daemonLockRelease) {
+      try {
+        daemonLockRelease();
+      } catch (_) {}
+    }
     exitFn(0);
   };
 
