@@ -1,0 +1,19 @@
+[Unit]
+Description=PRINTELLECT Kiosk Service Migration Boot Reconciler
+Documentation=https://github.com/PRINTELLECT/printellect-kiosk-server
+After=local-fs.target
+Before=printellect.service
+ConditionPathExists=/etc/printellect/migration.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /etc/printellect/recover-migration.sh --reconcile-boot --non-blocking-start
+TimeoutStartSec=90s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=printellect-migration-recover
+
+[Install]
+WantedBy=multi-user.target
+

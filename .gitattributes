@@ -1,0 +1,9 @@
+*.sh text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+bin/* text eol=lf
+systemd/*.service text eol=lf
+keys/*.pub.pem text eol=lf
+
