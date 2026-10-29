@@ -1,0 +1,17 @@
+#!/usr/bin/env node
+
+/**
+ * PRINTELLECT Kiosk Server — Standalone Printer Setup CLI
+ */
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { runSetupWizard } from '../setup.js';
+
+runSetupWizard()
+  .then((result) => {
+    process.exit(result.success ? 0 : 1);
+  })
+  .catch((err) => {
+    console.error('\n[FATAL ERROR] Printer setup failed:', err.message);
+    process.exit(1);
+  });

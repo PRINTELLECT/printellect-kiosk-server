@@ -1,2 +1,9 @@
 node_modules
 config.json
+dist/
+.keys/
+*.pem
+!keys/
+!keys/release-key.pub.pem
+.dist_tmp/
+.node24/

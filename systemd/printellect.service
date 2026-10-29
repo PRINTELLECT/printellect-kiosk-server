@@ -1,0 +1,43 @@
+[Unit]
+Description=PRINTELLECT Kiosk Print Daemon
+Documentation=https://github.com/PRINTELLECT/printellect-kiosk-server
+After=network-online.target cups.service
+Wants=network-online.target cups.service
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=printellect
+Group=printellect
+SupplementaryGroups=lp
+
+# Working Directory and Environment
+WorkingDirectory=/opt/printellect/current
+EnvironmentFile=/etc/printellect/kiosk.env
+ExecStart=/usr/bin/node /opt/printellect/current/index.js
+
+# Restart and Recovery Behavior
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+# Logging to Journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=printellect-kiosk
+
+# Security Hardening & Sandboxing
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/printellect /tmp
+
+[Install]
+WantedBy=multi-user.target

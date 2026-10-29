@@ -2,9 +2,23 @@
   "name": "printellect-kiosk-daemon",
   "version": "1.0.0",
   "description": "",
-  "main": "firebase.js",
+  "main": "index.js",
+  "bin": {
+    "printellect-setup": "./bin/printellect-setup"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "setup": "node setup.js",
+    "test": "node --test",
+    "package": "node scripts/package-release.js",
+    "keygen": "node scripts/generate-keys.js",
+    "sign": "node scripts/sign-release.js",
+    "verify": "node scripts/verify-release.js",
+    "service:install": "bash scripts/install-service.sh",
+    "service:recover": "bash scripts/recover-migration.sh",
+    "runtime:stage": "bash scripts/stage-node-runtime.sh",
+    "runtime:validate-legacy": "bash scripts/validate-legacy-node24.sh",
+    "print:verify": "node scripts/verify-print-acceptance.js"
   },
   "keywords": [],
   "author": "",
@@ -13,5 +27,8 @@
   "dependencies": {
     "firebase": "^12.16.0",
     "pdf-to-printer": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }
