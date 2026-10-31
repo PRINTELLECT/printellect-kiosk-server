@@ -37,7 +37,7 @@ function promptUser(query) {
 async function setupPrinters() {
   console.log('Fetching available printers...');
   const printers = await printer.getPrinters();
-  
+
   if (printers.length === 0) {
     console.error('No printers found on this system!');
     process.exit(1);
@@ -87,7 +87,7 @@ async function startDaemon() {
   const args = process.argv.slice(2);
   const isSetup = args.includes('--setup');
   const sessionId = args.find(arg => arg !== '--setup');
-  
+
   if (!sessionId) {
     console.error('Usage: node index.js <SESSION_ID> [--setup]');
     process.exit(1);
@@ -149,11 +149,11 @@ async function startDaemon() {
 async function processJob(jobId, jobData, config) {
   try {
     const taskDocRef = doc(db, 'tasks', jobId);
-    
+
     // In Printellect architecture, files for a task are usually stored in a subcollection `files`
     const filesRef = collection(db, `tasks/${jobId}/files`);
     const filesSnap = await getDocs(filesRef);
-    
+
     if (filesSnap.empty) {
       console.log(`[INFO] No files found in tasks/${jobId}/files.`);
       return;
@@ -173,11 +173,11 @@ async function processJob(jobId, jobData, config) {
       const isColor = fileData['color'] === true;
       if (isColor) hasColorFile = true;
       else hasBwFile = true;
-      
+
       const copies = fileData['copies'] || 1;
       const pages = fileData['total-pages'] || 1;
       const totalFilePages = copies * pages;
-      
+
       let targetPrinter;
 
       if (isColor) {
@@ -211,26 +211,26 @@ async function processJob(jobId, jobData, config) {
       if (downloadUrl) {
         console.log(`Downloading ${fileName}...`);
         const filePath = path.join(tempDir, fileName);
-        
+
         try {
           await downloadFile(downloadUrl, filePath);
-          
+
           const trayLabel = (targetPrinter === config.colorPrinter) ? 'Tray 2' : 'Tray 1';
           console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'} [${trayLabel}]`);
           console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
-          
+
           // Pass printer and layout options
           const printOptions = {
             copies: copies,
             color: isColor,
             duplex: fileData['fb'] === true ||
-                    fileData['front-back'] === true ||
-                    fileData['duplex'] === true ||
-                    String(fileData['fb']).toLowerCase() === 'true' ||
-                    String(fileData['front-back']).toLowerCase() === 'true',
+              fileData['front-back'] === true ||
+              fileData['duplex'] === true ||
+              String(fileData['fb']).toLowerCase() === 'true' ||
+              String(fileData['front-back']).toLowerCase() === 'true',
           };
           if (targetPrinter) printOptions.printer = targetPrinter;
-          
+
           // Print the file to the mapped printer
           try {
             await printer.print(filePath, printOptions);
@@ -242,7 +242,7 @@ async function processJob(jobId, jobData, config) {
             }
           } catch (printErr) {
             console.error(`⚠️ Error printing to ${targetPrinter || 'Default'}: ${printErr.message}.`);
-            
+
             // Fallback logic:
             // Color jobs CANNOT fall back to B&W printer (would lose color).
             // B&W jobs CAN fall back to Color printer.
@@ -270,12 +270,12 @@ async function processJob(jobId, jobData, config) {
           } else {
             pendingBwPages -= totalFilePages;
           }
-          
+
           // Cleanup temp file safely
           if (fs.existsSync(filePath)) {
             try {
               fs.unlinkSync(filePath);
-            } catch (_) {}
+            } catch (_) { }
           }
         }
       }
@@ -285,7 +285,7 @@ async function processJob(jobId, jobData, config) {
     const collectionTrays = [];
     if (printedOnBw) collectionTrays.push('Tray 1');
     if (printedOnColor) collectionTrays.push('Tray 2');
-    
+
     // In case tracking was indeterminate (e.g. single printer or test), fallback based on file composition
     if (collectionTrays.length === 0) {
       if (hasBwFile) collectionTrays.push('Tray 1');
