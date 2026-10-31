@@ -251,8 +251,31 @@ async function processJob(jobId, jobData, config) {
             mediaType = 'Photographic';
           }
 
-          // Scale: fit, actual, id, fill (default: fit)
-          const scale = fileData['scale'] || (jobData['print-params'] && jobData['print-params']['scale']);
+          // Scaling: fit, actual, fill, auto (default: auto)
+          const rawScaling = fileData['scaling'] || fileData['scale'] || fileData['scaleMode'] ||
+            (jobData['print-params'] && (jobData['print-params']['scaling'] || jobData['print-params']['scale']));
+          let scaling = 'auto';
+          if (rawScaling) {
+            const sStr = String(rawScaling).trim().toLowerCase();
+            if (sStr === 'fit' || sStr === 'fit-to-page') scaling = 'fit';
+            else if (sStr === 'actual' || sStr === 'actual-size' || sStr === 'none' || sStr === 'id') scaling = 'actual';
+            else if (sStr === 'fill' || sStr === 'expand') scaling = 'fill';
+            else scaling = 'auto';
+          }
+
+          // Orientation: portrait, landscape (default: portrait)
+          const rawOrientation = fileData['orientation'] ||
+            (jobData['print-params'] && jobData['print-params']['orientation']);
+          let orientation = 'portrait';
+          if (rawOrientation) {
+            const oStr = String(rawOrientation).trim().toLowerCase();
+            if (oStr === 'landscape' || oStr === 'horizontal') orientation = 'landscape';
+            else orientation = 'portrait';
+          }
+
+          // Page size (optional)
+          const pageSize = fileData['pageSize'] || fileData['page-size'] ||
+            (jobData['print-params'] && jobData['print-params']['pageSize']);
 
           const isDuplex = fileData['fb'] === true ||
             fileData['front-back'] === true ||
@@ -262,12 +285,16 @@ async function processJob(jobId, jobData, config) {
 
           // Pass printer and layout options
           const printOptions = {
+            jobId: jobId,
             copies: copies,
             color: !grayscale,
             grayscale: grayscale,
             quality: quality,
             mediaType: mediaType,
-            scale: scale,
+            orientation: orientation,
+            scaling: scaling,
+            scale: scaling,
+            pageSize: pageSize,
             duplex: isDuplex,
             jobTitle: `job_${jobId}_${fileDoc.id}`,
           };
@@ -279,8 +306,10 @@ async function processJob(jobId, jobData, config) {
             grayscale,
             quality,
             mediaType,
+            orientation,
+            scaling,
             duplex: isDuplex,
-            scale: scale || 'fit',
+            pageSize: pageSize || 'Default',
           });
 
           // Print the file to the mapped printer

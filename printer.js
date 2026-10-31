@@ -91,6 +91,59 @@ const MEDIA_TYPE_MAP = {
 };
 
 /**
+ * Resolves standard print scaling options to CUPS `-o` flags.
+ * Supported values: 'fit' | 'actual' | 'fill' | 'auto' (default: 'auto')
+ *
+ * Mappings:
+ *   - 'fit' | 'fit-to-page': -o print-scaling=fit -o fit-to-page
+ *   - 'actual' | 'actual-size' | 'none' | 'id': -o print-scaling=none -o natural-scaling=100
+ *   - 'fill' | 'expand': -o print-scaling=fill
+ *   - 'auto' (default): -o print-scaling=auto
+ *
+ * @param {string} scalingInput
+ * @returns {string[]} array of lp option flags
+ */
+export function resolveScalingOptions(scalingInput) {
+  const normalized = String(scalingInput || 'auto').trim().toLowerCase();
+  switch (normalized) {
+    case 'fit':
+    case 'fit-to-page':
+      return ['-o', 'print-scaling=fit', '-o', 'fit-to-page'];
+    case 'actual':
+    case 'actual-size':
+    case 'none':
+    case 'id':
+    case '100':
+      return ['-o', 'print-scaling=none', '-o', 'natural-scaling=100'];
+    case 'fill':
+    case 'expand':
+      return ['-o', 'print-scaling=fill'];
+    case 'auto':
+    default:
+      return ['-o', 'print-scaling=auto'];
+  }
+}
+
+/**
+ * Resolves page orientation options to CUPS `-o` flags.
+ * Supported values: 'portrait' / 'vertical' (default), 'landscape' / 'horizontal'
+ *
+ * Mappings:
+ *   - 'landscape' | 'horizontal': -o orientation-requested=4 -o landscape
+ *   - 'portrait' | 'vertical' (default): -o orientation-requested=3
+ *
+ * @param {string} orientationInput
+ * @returns {string[]} array of lp option flags
+ */
+export function resolveOrientationOptions(orientationInput) {
+  const normalized = String(orientationInput || 'portrait').trim().toLowerCase();
+  if (normalized === 'landscape' || normalized === 'horizontal') {
+    return ['-o', 'orientation-requested=4', '-o', 'landscape'];
+  }
+  return ['-o', 'orientation-requested=3'];
+}
+
+/**
  * Prints a PDF file to the specified printer using CUPS `lp`.
  *
  * Options:
@@ -102,8 +155,12 @@ const MEDIA_TYPE_MAP = {
  *   - mediaType: 'Stationery' | 'Photographic' | 'Auto' (default 'Stationery')
  *   - isPhoto: boolean (if true and quality === 'high', mediaType defaults to 'Photographic')
  *   - duplex: boolean (true -> sides=two-sided-long-edge, false -> sides=one-sided)
- *   - scale: 'fit' | 'actual' | 'id' | 'fill' (default 'fit')
+ *   - tumble: boolean (if true and landscape duplex, sides=two-sided-short-edge)
+ *   - orientation: 'portrait' | 'landscape' (default 'portrait')
+ *   - scaling / scale: 'fit' | 'actual' | 'fill' | 'auto' (default 'auto')
+ *   - pageSize: string (e.g. 'A4', 'Letter')
  *   - jobTitle: string (safe job identifier)
+ *   - jobId: string (optional task/job ID for structured logs)
  */
 export async function print(filePath, options = {}) {
   if (!filePath || typeof filePath !== 'string' || filePath.trim().length === 0) {
@@ -111,6 +168,7 @@ export async function print(filePath, options = {}) {
   }
 
   const resolvedFilePath = path.resolve(filePath);
+  const jobTag = options.jobId ? `[JOB ${options.jobId}] ` : '';
 
   if (isWindows && ptp) {
     const ptpOptions = {};
@@ -182,48 +240,69 @@ export async function print(filePath, options = {}) {
   }
   args.push('-o', `MediaType=${mediaType}`);
 
-  // 7. Duplex (sides / Duplex)
+  // 7. Page Size (PageSize)
+  if (options.pageSize || options.paperSize) {
+    const rawPageSize = String(options.pageSize || options.paperSize).trim();
+    if (/^[A-Za-z0-9_-]+$/.test(rawPageSize)) {
+      args.push('-o', `PageSize=${rawPageSize}`);
+    }
+  }
+
+  // 8. Orientation
+  const orientationArgs = resolveOrientationOptions(options.orientation);
+  args.push(...orientationArgs);
+
+  // 9. Duplex (sides / Duplex)
+  const isLandscape = String(options.orientation || '').trim().toLowerCase() === 'landscape' ||
+                      String(options.orientation || '').trim().toLowerCase() === 'horizontal';
+  const shouldTumble = options.tumble === true;
+
   if (options.duplex === true) {
-    args.push('-o', 'sides=two-sided-long-edge');
-    args.push('-o', 'Duplex=DuplexNoTumble');
+    if (isLandscape && shouldTumble) {
+      args.push('-o', 'sides=two-sided-short-edge');
+      args.push('-o', 'Duplex=DuplexTumble');
+    } else {
+      args.push('-o', 'sides=two-sided-long-edge');
+      args.push('-o', 'Duplex=DuplexNoTumble');
+    }
   } else if (options.duplex === false) {
     args.push('-o', 'sides=one-sided');
     args.push('-o', 'Duplex=None');
   }
 
-  // 8. Scaling (print-scaling / fit-to-page)
-  const scale = String(options.scale || options.scaling || 'fit').trim().toLowerCase();
-  if (scale === 'actual' || scale === 'none') {
-    args.push('-o', 'print-scaling=none');
-  } else if (scale === 'fill') {
-    args.push('-o', 'print-scaling=fill');
-  } else {
-    // Default fit
-    args.push('-o', 'fit-to-page');
-    args.push('-o', 'print-scaling=fit-to-page');
-  }
+  // 10. Scaling (print-scaling / natural-scaling / fit-to-page)
+  const scalingArgs = resolveScalingOptions(options.scaling || options.scale || options.scaleMode);
+  args.push(...scalingArgs);
 
-  // 9. Input file
+  // 11. Input file
   args.push(resolvedFilePath);
 
   // Debug log printing the exact command line and flags
   const formattedArgs = args.map((arg) => (arg.includes(' ') ? `"${arg}"` : arg)).join(' ');
-  console.log(`[CUPS] Executing: lp ${formattedArgs}`);
+  console.log(`${jobTag}[CUPS] Executing: lp ${formattedArgs}`);
 
   try {
     const { stdout, stderr } = await execFileAsync('lp', args);
+    if (stdout && stdout.trim().length > 0) {
+      console.log(`${jobTag}[CUPS STDOUT] ${stdout.trim()}`);
+    }
     if (stderr && stderr.trim().length > 0) {
-      console.warn(`[CUPS WARN] ${stderr.trim()}`);
+      console.warn(`${jobTag}[CUPS STDERR/WARN] ${stderr.trim()}`);
     }
     return stdout;
   } catch (err) {
     const exitCode = err.code !== undefined ? err.code : (err.status !== undefined ? err.status : 'UNKNOWN');
     const stderrOutput = (err.stderr || '').trim();
-    const errMsg = `CUPS printing failed (exit code ${exitCode}): ${stderrOutput || err.message}`;
+    const stdoutOutput = (err.stdout || '').trim();
+    const errMsg = `${jobTag}CUPS printing failed (exit code ${exitCode}): ${stderrOutput || err.message}`;
     console.error(`[CUPS ERROR] ${errMsg}`);
+    if (stdoutOutput) {
+      console.error(`${jobTag}[CUPS STDOUT ON ERROR] ${stdoutOutput}`);
+    }
     const wrapped = new Error(errMsg);
     wrapped.exitCode = exitCode;
     wrapped.stderr = stderrOutput;
+    wrapped.stdout = stdoutOutput;
     throw wrapped;
   }
 }
@@ -231,5 +310,7 @@ export async function print(filePath, options = {}) {
 export default {
   isSafeQueueName,
   getPrinters,
+  resolveScalingOptions,
+  resolveOrientationOptions,
   print,
 };
