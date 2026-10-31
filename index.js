@@ -223,7 +223,11 @@ async function processJob(jobId, jobData, config) {
           const printOptions = {
             copies: copies,
             color: isColor,
-            duplex: fileData['fb'] === true,
+            duplex: fileData['fb'] === true ||
+                    fileData['front-back'] === true ||
+                    fileData['duplex'] === true ||
+                    String(fileData['fb']).toLowerCase() === 'true' ||
+                    String(fileData['front-back']).toLowerCase() === 'true',
           };
           if (targetPrinter) printOptions.printer = targetPrinter;
           

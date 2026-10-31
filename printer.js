@@ -80,8 +80,10 @@ export async function print(filePath, options = {}) {
   }
   if (options.duplex === true) {
     args.push('-o', 'sides=two-sided-long-edge');
+    args.push('-o', 'Duplex=DuplexNoTumble');
   } else if (options.duplex === false) {
     args.push('-o', 'sides=one-sided');
+    args.push('-o', 'Duplex=None');
   }
 
   // Fit to page by default on CUPS
