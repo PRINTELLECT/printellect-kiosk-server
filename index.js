@@ -239,18 +239,6 @@ async function processJob(jobId, jobData, config) {
             grayscale = fileData['color'] === false || String(fileData['color']).toLowerCase() === 'false';
           }
 
-          // MediaType: Stationery, Photographic, Auto (default: Stationery)
-          const rawMediaType = fileData['mediaType'] || fileData['media-type'] || fileData['paperType'];
-          let mediaType = 'Stationery';
-          if (rawMediaType) {
-            const mStr = String(rawMediaType).trim().toLowerCase();
-            if (mStr.includes('photo')) mediaType = 'Photographic';
-            else if (mStr === 'auto') mediaType = 'Auto';
-            else mediaType = 'Stationery';
-          } else if (quality === 'high' && (fileData['isPhoto'] || /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(fileName))) {
-            mediaType = 'Photographic';
-          }
-
           // Scaling: fit, actual, fill, auto (default: auto)
           const rawScaling = fileData['scaling'] || fileData['scale'] || fileData['scaleMode'] ||
             (jobData['print-params'] && (jobData['print-params']['scaling'] || jobData['print-params']['scale']));
@@ -293,7 +281,6 @@ async function processJob(jobId, jobData, config) {
             color: !grayscale,
             grayscale: grayscale,
             quality: quality,
-            mediaType: mediaType,
             nup: nup,
             orientation: orientation,
             scaling: scaling,
@@ -309,7 +296,6 @@ async function processJob(jobId, jobData, config) {
             copies,
             grayscale,
             quality,
-            mediaType,
             orientation,
             nup: nup || '1-in-1',
             scaling,

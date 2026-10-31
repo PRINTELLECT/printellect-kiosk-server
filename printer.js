@@ -71,7 +71,6 @@ export async function getPrinters() {
  * Supported CUPS options for Canon MAXIFY GX6100 and standard CUPS drivers:
  * - cupsPrintQuality: Draft, Normal, High
  * - ColorModel: RGB, Gray
- * - MediaType: Stationery, Photographic, Auto
  */
 const QUALITY_MAP = {
   draft: 'Draft',
@@ -80,14 +79,6 @@ const QUALITY_MAP = {
   standard: 'Normal',
   high: 'High',
   best: 'High',
-};
-
-const MEDIA_TYPE_MAP = {
-  stationery: 'Stationery',
-  plain: 'Stationery',
-  photographic: 'Photographic',
-  photo: 'Photographic',
-  auto: 'Auto',
 };
 
 /**
@@ -152,8 +143,6 @@ export function resolveOrientationOptions(orientationInput) {
  *   - quality: 'draft' | 'normal' | 'high' (default 'normal')
  *   - grayscale: boolean (true -> ColorModel=Gray, false -> ColorModel=RGB, default false)
  *   - color: boolean (legacy alias: true -> ColorModel=RGB, false -> ColorModel=Gray)
- *   - mediaType: 'Stationery' | 'Photographic' | 'Auto' (default 'Stationery')
- *   - isPhoto: boolean (if true and quality === 'high', mediaType defaults to 'Photographic')
  *   - duplex: boolean (true -> sides=two-sided-long-edge, false -> sides=one-sided)
  *   - tumble: boolean (if true and landscape duplex, sides=two-sided-short-edge)
  *   - orientation: 'portrait' | 'landscape' (default 'portrait')
@@ -229,18 +218,7 @@ export async function print(filePath, options = {}) {
   const colorModel = isGray ? 'Gray' : 'RGB';
   args.push('-o', `ColorModel=${colorModel}`);
 
-  // 6. Media Type (MediaType)
-  // Verified options: Stationery (plain paper), Photographic, Auto (default: Stationery)
-  let mediaType = 'Stationery';
-  if (options.mediaType) {
-    const rawMediaType = String(options.mediaType).trim().toLowerCase();
-    mediaType = MEDIA_TYPE_MAP[rawMediaType] || 'Stationery';
-  } else if (cupsQuality === 'High' && (options.isPhoto === true || options.isImage === true)) {
-    mediaType = 'Photographic';
-  }
-  args.push('-o', `MediaType=${mediaType}`);
-
-  // 7. Page Size (PageSize)
+  // 6. Page Size (PageSize)
   if (options.pageSize || options.paperSize) {
     const rawPageSize = String(options.pageSize || options.paperSize).trim();
     if (/^[A-Za-z0-9_-]+$/.test(rawPageSize)) {
@@ -248,11 +226,11 @@ export async function print(filePath, options = {}) {
     }
   }
 
-  // 8. Orientation
+  // 7. Orientation
   const orientationArgs = resolveOrientationOptions(options.orientation);
   args.push(...orientationArgs);
 
-  // 9. Duplex (sides / Duplex)
+  // 8. Duplex (sides / Duplex)
   const isLandscape = String(options.orientation || '').trim().toLowerCase() === 'landscape' ||
                       String(options.orientation || '').trim().toLowerCase() === 'horizontal';
   const shouldTumble = options.tumble === true;
@@ -270,11 +248,11 @@ export async function print(filePath, options = {}) {
     args.push('-o', 'Duplex=None');
   }
 
-  // 10. Scaling (print-scaling / natural-scaling / fit-to-page)
+  // 9. Scaling (print-scaling / natural-scaling / fit-to-page)
   const scalingArgs = resolveScalingOptions(options.scaling || options.scale || options.scaleMode);
   args.push(...scalingArgs);
 
-  // 11. Pages per side (number-up)
+  // 10. Pages per side (number-up)
   if (options.nup !== undefined && options.nup !== null) {
     const rawNup = String(options.nup).trim().toLowerCase();
     let numUp = 1;
@@ -288,7 +266,7 @@ export async function print(filePath, options = {}) {
     }
   }
 
-  // 12. Input file
+  // 11. Input file
   args.push(resolvedFilePath);
 
   // Debug log printing the exact command line and flags
