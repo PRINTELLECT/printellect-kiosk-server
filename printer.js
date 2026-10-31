@@ -274,7 +274,21 @@ export async function print(filePath, options = {}) {
   const scalingArgs = resolveScalingOptions(options.scaling || options.scale || options.scaleMode);
   args.push(...scalingArgs);
 
-  // 11. Input file
+  // 11. Pages per side (number-up)
+  if (options.nup !== undefined && options.nup !== null) {
+    const rawNup = String(options.nup).trim().toLowerCase();
+    let numUp = 1;
+    if (rawNup.includes('2')) numUp = 2;
+    else if (rawNup.includes('4')) numUp = 4;
+    else if (rawNup.includes('6')) numUp = 6;
+    else if (rawNup.includes('9')) numUp = 9;
+    else if (rawNup.includes('16')) numUp = 16;
+    if (numUp > 1) {
+      args.push('-o', `number-up=${numUp}`);
+    }
+  }
+
+  // 12. Input file
   args.push(resolvedFilePath);
 
   // Debug log printing the exact command line and flags

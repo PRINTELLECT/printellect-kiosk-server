@@ -263,6 +263,9 @@ async function processJob(jobId, jobData, config) {
             else scaling = 'auto';
           }
 
+          // Pages per side: 1-in-1, 2-in-1, 4-in-1 (default: 1)
+          const nup = fileData['nup'] || (jobData['print-params'] && jobData['print-params']['nup']);
+
           // Orientation: portrait, landscape (default: portrait)
           const rawOrientation = fileData['orientation'] ||
             (jobData['print-params'] && jobData['print-params']['orientation']);
@@ -291,6 +294,7 @@ async function processJob(jobId, jobData, config) {
             grayscale: grayscale,
             quality: quality,
             mediaType: mediaType,
+            nup: nup,
             orientation: orientation,
             scaling: scaling,
             scale: scaling,
@@ -307,6 +311,7 @@ async function processJob(jobId, jobData, config) {
             quality,
             mediaType,
             orientation,
+            nup: nup || '1-in-1',
             scaling,
             duplex: isDuplex,
             pageSize: pageSize || 'Default',
