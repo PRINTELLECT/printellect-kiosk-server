@@ -219,17 +219,69 @@ async function processJob(jobId, jobData, config) {
           console.log(`Routing ${fileName} (${totalFilePages} pages) to [${isColor ? 'COLOR' : 'B&W'}] printer: ${targetPrinter || 'System Default'} [${trayLabel}]`);
           console.log(`Current Load -> B&W: ${pendingBwPages} pages | Color: ${pendingColorPages} pages`);
 
+          // Extract print options with safe defaults
+          // Quality: draft, normal, high (default: normal)
+          const rawQuality = fileData['quality'] || fileData['cupsPrintQuality'] || (jobData['print-params'] && jobData['print-params']['quality']);
+          let quality = 'normal';
+          if (rawQuality) {
+            const qStr = String(rawQuality).trim().toLowerCase();
+            if (qStr === 'draft' || qStr === 'economical') quality = 'draft';
+            else if (qStr === 'high' || qStr === 'best') quality = 'high';
+            else quality = 'normal';
+          }
+
+          // Grayscale: boolean (default: false, meaning RGB color)
+          // If explicitly requested via grayscale, or if color is false
+          let grayscale = false;
+          if (fileData['grayscale'] !== undefined) {
+            grayscale = fileData['grayscale'] === true || String(fileData['grayscale']).toLowerCase() === 'true';
+          } else if (fileData['color'] !== undefined) {
+            grayscale = fileData['color'] === false || String(fileData['color']).toLowerCase() === 'false';
+          }
+
+          // MediaType: Stationery, Photographic, Auto (default: Stationery)
+          const rawMediaType = fileData['mediaType'] || fileData['media-type'] || fileData['paperType'];
+          let mediaType = 'Stationery';
+          if (rawMediaType) {
+            const mStr = String(rawMediaType).trim().toLowerCase();
+            if (mStr.includes('photo')) mediaType = 'Photographic';
+            else if (mStr === 'auto') mediaType = 'Auto';
+            else mediaType = 'Stationery';
+          } else if (quality === 'high' && (fileData['isPhoto'] || /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(fileName))) {
+            mediaType = 'Photographic';
+          }
+
+          // Scale: fit, actual, id, fill (default: fit)
+          const scale = fileData['scale'] || (jobData['print-params'] && jobData['print-params']['scale']);
+
+          const isDuplex = fileData['fb'] === true ||
+            fileData['front-back'] === true ||
+            fileData['duplex'] === true ||
+            String(fileData['fb']).toLowerCase() === 'true' ||
+            String(fileData['front-back']).toLowerCase() === 'true';
+
           // Pass printer and layout options
           const printOptions = {
             copies: copies,
-            color: isColor,
-            duplex: fileData['fb'] === true ||
-              fileData['front-back'] === true ||
-              fileData['duplex'] === true ||
-              String(fileData['fb']).toLowerCase() === 'true' ||
-              String(fileData['front-back']).toLowerCase() === 'true',
+            color: !grayscale,
+            grayscale: grayscale,
+            quality: quality,
+            mediaType: mediaType,
+            scale: scale,
+            duplex: isDuplex,
+            jobTitle: `job_${jobId}_${fileDoc.id}`,
           };
           if (targetPrinter) printOptions.printer = targetPrinter;
+
+          console.log(`[JOB ${jobId}] Prepared print options for ${fileName}:`, {
+            printer: targetPrinter || 'Default',
+            copies,
+            grayscale,
+            quality,
+            mediaType,
+            duplex: isDuplex,
+            scale: scale || 'fit',
+          });
 
           // Print the file to the mapped printer
           try {
